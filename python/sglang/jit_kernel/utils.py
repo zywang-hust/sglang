@@ -263,6 +263,10 @@ def load_jit(
             raise ValueError(f"Dependency {dep} is not registered.")
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
+    # Append CCCL headers as a fallback so JIT compilation works on toolchains
+    # whose CUDA headers are missing CCCL (e.g. `nv/target`).
+    extra_include_paths = extra_include_paths + _get_cccl_include_paths()
+
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
     if cpp_files or cuda_files:
         module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
@@ -421,6 +425,32 @@ def _find_package_root(package: str) -> Optional[pathlib.Path]:
     if spec is None or spec.origin is None:
         return None
     return pathlib.Path(spec.origin).resolve().parent
+
+
+@cache_once
+def _get_cccl_include_paths() -> List[str]:
+    """Locate CCCL (libcu++/CUB/Thrust) headers bundled with flashinfer.
+
+    Some pip-installed CUDA toolchains (e.g. the ``nvidia-cu*`` wheels) ship an
+    incomplete header set that is missing CCCL headers such as ``nv/target``,
+    which newer ``cuda_fp16.h`` transitively includes. This causes JIT
+    compilation to fail with ``fatal error: nv/target: No such file or
+    directory``. flashinfer bundles a full CCCL tree, so we reuse it as a
+    fallback include path. Returns an empty list when unavailable so callers
+    degrade gracefully.
+    """
+    if is_hip_runtime():
+        return []
+    flashinfer_root = _find_package_root("flashinfer")
+    if flashinfer_root is None:
+        return []
+    cccl_root = flashinfer_root / "data" / "cccl"
+    candidates = [
+        cccl_root / "libcudacxx" / "include",
+        cccl_root / "cub",
+        cccl_root / "thrust",
+    ]
+    return [str(p) for p in candidates if p.exists()]
 
 
 # NOTE: this might also be used in __main__.py for compile flags export
