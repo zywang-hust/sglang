@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    MiniCPMReqToTokenPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NoOpMHATokenToKVPool,
@@ -290,6 +291,44 @@ class ModelRunnerKVCacheMixin:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         pre_alloc_size=pre_alloc_size,
                     )
+            elif self.minicpm_hybrid_config is not None:
+                from sglang.srt.mem_cache.memory_pool import MiniCPMHybridReqToTokenPool
+
+                if self.model_config.has_sparse_attention:
+                    self.req_to_token_pool = MiniCPMHybridReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        kernel_size=self.model_config.sparse_kernel_size,
+                        kernel_stride=self.model_config.sparse_kernel_stride,
+                        cache_params=self.minicpm_hybrid_config.mamba2_cache_params,
+                        mamba_size=self.server_args.max_mamba_cache_size,
+                        mamba_spec_state_size=max_num_reqs,
+                        enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    )
+                else:
+                    self.req_to_token_pool = HybridReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        cache_params=self.minicpm_hybrid_config.mamba2_cache_params,
+                        mamba_layer_ids=[
+                            i
+                            for i in self.minicpm_hybrid_config.mamba2_cache_params.layers
+                            if self.start_layer <= i < self.end_layer
+                        ],
+                        mamba_size=self.server_args.max_mamba_cache_size,
+                        mamba_spec_state_size=max_num_reqs,
+                        enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                        start_layer=self.start_layer,
+                    )
             elif config := self.mambaish_config:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
@@ -311,6 +350,16 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                )
+            elif self.model_config.has_sparse_attention:
+                self.req_to_token_pool = MiniCPMReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    kernel_size=self.model_config.sparse_kernel_size,
+                    kernel_stride=self.model_config.sparse_kernel_stride,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(

@@ -153,6 +153,13 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+def is_minicpm_hybrid(config: PretrainedConfig) -> bool:
+    """Check if this is a hybrid MiniCPM model with mixed attention layers"""
+    from sglang.srt.configs.minicpm import MiniCPMHybridConfig
+
+    return isinstance(config, MiniCPMHybridConfig)
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -175,6 +182,7 @@ class ModelConfig:
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
+        force_dense_minicpm: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -241,6 +249,8 @@ class ModelConfig:
                 )
             else:
                 enable_multimodal = True
+
+        self.force_dense_minicpm = force_dense_minicpm
 
         # Config draft model
         self._config_draft_model()
@@ -369,6 +379,64 @@ class ModelConfig:
             self.hf_config, "is_matryoshka", False
         )
 
+    @property
+    def has_sparse_attention(self):
+        """Check if model has sparse attention (accesses hf_config.has_sparse_attention)."""
+        return (
+            getattr(self.hf_config, "has_sparse_attention", False)
+            if not self.force_dense_minicpm
+            else False
+        )
+
+    @property
+    def has_lightning_layers(self):
+        """Check if model has lightning layers (accesses hf_config.has_lightning_layers)."""
+        return getattr(self.hf_config, "has_lightning_layers", False)
+
+    @property
+    def sparse_layer_ids(self):
+        """Get layer IDs with sparse attention (accesses hf_config.sparse_layer_ids)."""
+        return (
+            getattr(self.hf_config, "sparse_layer_ids", [])
+            if not self.force_dense_minicpm
+            else []
+        )
+
+    @property
+    def lightning_layer_ids(self):
+        """Get layer IDs with lightning attention (accesses hf_config.lightning_layer_ids)."""
+        return getattr(self.hf_config, "lightning_layer_ids", [])
+
+    @property
+    def sparse_block_size(self):
+        """Get sparse block size (accesses hf_config.sparse_block_size)."""
+        return getattr(self.hf_config, "sparse_block_size", 32)
+
+    @property
+    def sparse_kernel_size(self):
+        """Get sparse kernel size (accesses hf_config.sparse_kernel_size)."""
+        return getattr(self.hf_config, "sparse_kernel_size", 32)
+
+    @property
+    def sparse_kernel_stride(self):
+        """Get sparse kernel stride (accesses hf_config.sparse_kernel_stride)."""
+        return getattr(self.hf_config, "sparse_kernel_stride", 16)
+
+    @property
+    def sparse_topk(self):
+        """Get sparse topk value (accesses hf_config.sparse_topk)."""
+        return getattr(self.hf_config, "sparse_topk", 8)
+
+    @property
+    def sparse_window_size(self):
+        """Get sparse window size (accesses hf_config.sparse_window_size)."""
+        return getattr(self.hf_config, "sparse_window_size", 64)
+
+    @property
+    def sparse_dense_len(self):
+        """Get sparse dense length (accesses hf_config.sparse_dense_len)."""
+        return getattr(self.hf_config, "sparse_dense_len", 512)
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -407,6 +475,7 @@ class ModelConfig:
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
+            force_dense_minicpm=server_args.force_dense_minicpm,
             **kwargs,
         )
 

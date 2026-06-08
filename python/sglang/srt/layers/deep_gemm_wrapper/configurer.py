@@ -23,7 +23,8 @@ def _compute_enable_deep_gemm():
 
     try:
         import deep_gemm  # noqa: F401
-    except ImportError:
+        from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
+    except (ImportError, RuntimeError, ModuleNotFoundError):
         return False
 
     return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()

@@ -162,6 +162,8 @@ ATTENTION_BACKEND_CHOICES = [
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "minicpm_flashattn",
+    "minicpm_flashinfer",
     # AMD specific
     "aiter",
     "wave",
@@ -709,6 +711,10 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_breakable_cuda_graph: bool = False
+    fuse_topk: bool = False
+    split_stage1: bool = False
+    dense_as_sparse: bool = False
+    force_dense_minicpm: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
@@ -2414,6 +2420,13 @@ class ServerArgs:
                 f"{model_arch} does not support triton attention backend, "
                 "as the first layer might not be an attention layer"
             )
+
+        elif model_arch in ["MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"]:
+            if self.force_dense_minicpm:
+                if self.attention_backend == "minicpm_flashattn":
+                    self.attention_backend = "fa3"
+                elif self.attention_backend == "minicpm_flashinfer":
+                    self.attention_backend = "flashinfer"
 
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
@@ -6450,6 +6463,26 @@ class ServerArgs:
             "--enable-breakable-cuda-graph",
             action="store_true",
             help="Use breakable CUDA graph for piecewise capture instead of torch.compile-based splitting.",
+        )
+        parser.add_argument(
+            "--fuse-topk",
+            action="store_true",
+            help="fuse stage1+maxpool+topk in minicpm into a single kernel",
+        )
+        parser.add_argument(
+            "--split-stage1",
+            action="store_true",
+            help="split stage1 into bmm+softmax+reduce_sum in minicpm",
+        )
+        parser.add_argument(
+            "--dense-as-sparse",
+            action="store_true",
+            help="treat dense batches as sparse in minicpm",
+        )
+        parser.add_argument(
+            "--force-dense-minicpm",
+            action="store_true",
+            help="Force dense attention in minicpm",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",

@@ -47,6 +47,7 @@ from sglang.srt.configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
+    MiniCPMHybridConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3_5Config,
@@ -2325,12 +2326,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return result[0] if result else None
 
     @property
+    def minicpm_hybrid_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, MiniCPMHybridConfig) and config.mixer_types is not None:
+            return config
+        return None
+
+    @property
     def mambaish_config(self):
         existing = (
             self.mamba2_config
             or self.hybrid_gdn_config
             or self.kimi_linear_config
             or self.hybrid_lightning_config
+            or self.minicpm_hybrid_config
         )
         if existing:
             return existing

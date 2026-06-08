@@ -1303,6 +1303,7 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            forward_batch=forward_batch,
         )
         attn_backend._replay_forward_batch = None
 

@@ -40,6 +40,7 @@ from sglang.srt.configs import (
     KimiVLConfig,
     LagunaConfig,
     LongcatFlashConfig,
+    MiniCPMHybridConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
     MultiModalityConfig,
@@ -106,6 +107,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3p5Config,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
+        MiniCPMHybridConfig,
     ]
 }
 
