@@ -69,6 +69,16 @@ else:
         shuffle_rows,
     )
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+    from sgl_kernel.infllm_v2 import (
+        blockmask_to_uint64,
+        infllmv2_attn_stage1,
+        infllmv2_attn_varlen_func,
+        infllmv2_attn_with_kvcache,
+        max_pooling_1d,
+        max_pooling_1d_varlen,
+        topk_to_uint64,
+        uint64_to_bool,
+    )
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_mla,
