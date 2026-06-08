@@ -168,6 +168,11 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         spec_info=forward_batch.spec_info,
+        # Generic side channel to the live forward_batch for out-of-tree
+        # backends that need per-iter fields not mirrored above (e.g. the
+        # MiniCPM sparse backend reads precomputed CPU metadata off it during
+        # replay). Mirrors the legacy _replay_forward_batch side channel.
+        _source_forward_batch=forward_batch,
     )
 
 

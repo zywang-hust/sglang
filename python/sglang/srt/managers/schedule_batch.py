@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import torch.nn.functional as F
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import (
@@ -811,6 +813,8 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.prefix_k1_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.prefix_k2_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -1635,6 +1639,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
 
+    # sparse related compressed cache loc
+    sparse_k1_loc: torch.Tensor = None  # shape: [b], int64
+    sparse_k2_loc: torch.Tensor = None  # shape: [b], int64
+    token_num_sparse_k1_cpu: torch.Tensor = None  # shape: [b], int64
+    token_num_sparse_k2_cpu: torch.Tensor = None  # shape: [b], int64
+    token_sum_sparse_k1: int = 0
+    token_sum_sparse_k2: int = 0
+
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
@@ -1769,6 +1781,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu_cache: torch.Tensor = None
     capture_hidden_mode: Optional[CaptureHiddenMode] = None
     return_hidden_states_before_norm: bool = False
+
+    # sparse
+    sparse_cache_seqlens_int32_cpu: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_k_cpu: Optional[torch.Tensor] = None
+    cu_seqlens_k1_cpu: Optional[torch.Tensor] = None
+    cu_seqlens_k2_cpu: Optional[torch.Tensor] = None
+    history_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    new_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    new_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    total_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_total_compress_k1_token_nums_cpu: Optional[torch.Tensor] = None
+    history_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    new_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    new_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_new_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cu_total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+
+    cache_seqlens_int32_stage1_cpu: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -1938,6 +1972,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
+        bs = len(self.reqs)
+
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
@@ -1950,6 +1986,53 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(r.fill_len, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
+        # compressed kv cache loc per bs
+
+        if self.model_config.has_sparse_attention:
+            kernel_size = self.model_config.sparse_kernel_size
+            kernel_stride = self.model_config.sparse_kernel_stride
+            token_num_sparse_k1_total = [
+                (
+                    (seq_len - kernel_size) // kernel_stride + 1
+                    if seq_len >= kernel_size
+                    else 0
+                )
+                for seq_len in seq_lens
+            ]
+            token_num_sparse_k1_prefix = [
+                (
+                    (prefix_len - kernel_size) // kernel_stride + 1
+                    if prefix_len >= kernel_size
+                    else 0
+                )
+                for prefix_len in prefix_lens
+            ]
+            token_num_sparse_k1 = [
+                t - p
+                for t, p in zip(token_num_sparse_k1_total, token_num_sparse_k1_prefix)
+            ]
+            token_sum_sparse_k1 = sum(token_num_sparse_k1)
+            token_num_sparse_k2_total = [
+                (
+                    (seq_len - kernel_size * 4) // (kernel_stride * 4) + 1
+                    if seq_len >= kernel_size * 4
+                    else 0
+                )
+                for seq_len in seq_lens
+            ]
+            token_num_sparse_k2_prefix = [
+                (
+                    (prefix_len - kernel_size * 4) // (kernel_stride * 4) + 1
+                    if prefix_len >= kernel_size * 4
+                    else 0
+                )
+                for prefix_len in prefix_lens
+            ]
+            token_num_sparse_k2 = [
+                t - p
+                for t, p in zip(token_num_sparse_k2_total, token_num_sparse_k2_prefix)
+            ]
+            token_sum_sparse_k2 = sum(token_num_sparse_k2)
 
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
@@ -1969,11 +2052,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
+        if self.model_config.has_sparse_attention:
+            self.token_sum_sparse_k1 = token_sum_sparse_k1
+            self.token_sum_sparse_k2 = token_sum_sparse_k2
+            self.token_num_sparse_k1_cpu = torch.tensor(
+                token_num_sparse_k1, dtype=torch.int64
+            )
+            self.token_num_sparse_k2_cpu = torch.tensor(
+                token_num_sparse_k2, dtype=torch.int64
+            )
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
-        )
+        (
+            out_cache_loc,
+            sparse_k1_loc,
+            sparse_k2_loc,
+            req_pool_indices_tensor,
+            req_pool_indices_cpu,
+        ) = alloc_for_extend(self)
 
         # Set fields
         input_embeds = []
@@ -2136,6 +2232,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices_cpu = req_pool_indices_cpu
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
+        self.sparse_k1_loc = sparse_k1_loc
+        self.sparse_k2_loc = sparse_k2_loc
+
         self.input_embeds = (
             torch.tensor(input_embeds, pin_memory=_pin).to(
                 self.device, non_blocking=True
@@ -2584,11 +2683,48 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
+        if self.model_config.has_sparse_attention:
+            seq_lens_next = self.seq_lens + 1
+            kernel_size = self.model_config.sparse_kernel_size
+            kernel_stride = self.model_config.sparse_kernel_stride
+            token_num_sparse_k1 = [
+                (
+                    1
+                    if seq_lens_next[batch_idx] >= kernel_size
+                    and (seq_lens_next[batch_idx] - kernel_size) % kernel_stride == 0
+                    else 0
+                )
+                for batch_idx in range(bs)
+            ]
+            token_sum_sparse_k1 = sum(token_num_sparse_k1)
+            token_num_sparse_k2 = [
+                (
+                    1
+                    if seq_lens_next[batch_idx] >= kernel_size * 4
+                    and (seq_lens_next[batch_idx] - kernel_size * 4)
+                    % (kernel_stride * 4)
+                    == 0
+                    else 0
+                )
+                for batch_idx in range(bs)
+            ]
+            token_sum_sparse_k2 = sum(token_num_sparse_k2)
+            self.token_sum_sparse_k1 = token_sum_sparse_k1
+            self.token_sum_sparse_k2 = token_sum_sparse_k2
+            self.token_num_sparse_k1_cpu = torch.tensor(
+                token_num_sparse_k1, dtype=torch.int64
+            )
+            self.token_num_sparse_k2_cpu = torch.tensor(
+                token_num_sparse_k2, dtype=torch.int64
+            )
+
         # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.out_cache_loc, self.sparse_k1_loc, self.sparse_k2_loc = alloc_for_decode(
+            self, token_per_req=1
+        )
 
         # Update req-level memory management fields
-        for req in self.reqs:
+        for i, req in enumerate(self.reqs):
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
@@ -2633,6 +2769,160 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )
+
+        is_sparse_minicpm = self.model_config.has_sparse_attention
+
+        if is_sparse_minicpm:
+            # sparse minicpm
+
+            topk = self.model_config.sparse_topk
+            block_size = self.model_config.sparse_block_size
+            window_size = self.model_config.sparse_window_size
+            sparse_topk = topk + (window_size // block_size)
+            num_sparse_topk_tokens = block_size * sparse_topk
+
+            k1_kernel_size = self.model_config.sparse_kernel_size
+            k1_kernel_stride = self.model_config.sparse_kernel_stride
+            k2_kernel_size = k1_kernel_size * 4
+            k2_kernel_stride = k1_kernel_stride * 4
+
+            seq_lens_cpu = self.seq_lens.to(device="cpu")
+            mod_block_size_cpu = seq_lens_cpu % block_size
+            cu_seqlens_k_cpu = F.pad(
+                torch.cumsum(self.seq_lens_cpu, dim=0, dtype=torch.int32), (1, 0)
+            )
+            cu_seqlens_q_cpu = torch.arange(0, bs + 1, dtype=torch.int32).to(
+                device="cpu"
+            )
+
+            sparse_cache_seqlens_cpu_t = torch.where(
+                mod_block_size_cpu == 0,
+                num_sparse_topk_tokens,
+                (sparse_topk - 1) * block_size + mod_block_size_cpu,
+            )
+            sparse_cache_seqlens_cpu = torch.where(
+                seq_lens_cpu <= num_sparse_topk_tokens,
+                seq_lens_cpu,
+                sparse_cache_seqlens_cpu_t,
+            )
+
+            self.sparse_cache_seqlens_int32_cpu = torch.repeat_interleave(
+                sparse_cache_seqlens_cpu, 2
+            )
+
+            self.sparse_cu_seqlens_k_cpu = F.pad(
+                torch.cumsum(
+                    self.sparse_cache_seqlens_int32_cpu, dim=0, dtype=torch.int32
+                ),
+                (1, 0),
+            )
+
+            self.cache_seqlens_int32_cpu = self.seq_lens.to(
+                dtype=torch.int32, device="cpu"
+            )
+            self.cache_seqlens_int32_stage1_cpu = self.seq_lens_cpu - 1
+
+            self.seqlens_k1_cpu = (
+                self.cache_seqlens_int32_cpu - k1_kernel_size
+            ) // k1_kernel_stride + 1
+            self.seqlens_k1_cpu.clamp_(min=0)
+            self.seqlens_k2_cpu = (
+                self.cache_seqlens_int32_cpu - k2_kernel_size
+            ) // k2_kernel_stride + 1
+            self.seqlens_k2_cpu.clamp_(min=0)
+            self.cu_seqlens_k1_cpu = F.pad(
+                torch.cumsum(self.seqlens_k1_cpu, dim=0, dtype=torch.int32), (1, 0)
+            )
+            self.cu_seqlens_k2_cpu = F.pad(
+                torch.cumsum(self.seqlens_k2_cpu, dim=0, dtype=torch.int32), (1, 0)
+            )
+
+            # copy k1_loc & k2_loc
+
+            # compress k1 & k2
+
+            self.token_nums_cpu = cu_seqlens_k_cpu[1:] - cu_seqlens_k_cpu[:-1]
+            self.input_lens_cpu = cu_seqlens_q_cpu[1:] - cu_seqlens_q_cpu[:-1]
+
+            self.history_lens_cpu = self.token_nums_cpu - self.input_lens_cpu
+
+            self.history_compress_k1_token_nums_cpu = torch.maximum(
+                (self.history_lens_cpu - k1_kernel_size) // k1_kernel_stride + 1,
+                torch.zeros(1, device=self.history_lens_cpu.device, dtype=torch.int32),
+            )
+            self.history_compress_k2_token_nums_cpu = torch.maximum(
+                (self.history_lens_cpu - k2_kernel_size) // k2_kernel_stride + 1,
+                torch.zeros(1, device=self.history_lens_cpu.device, dtype=torch.int32),
+            )
+
+            self.new_k1_token_nums_cpu = (
+                self.token_nums_cpu
+                - self.history_compress_k1_token_nums_cpu * k1_kernel_stride
+            )
+            self.new_k2_token_nums_cpu = (
+                self.token_nums_cpu
+                - self.history_compress_k2_token_nums_cpu * k2_kernel_stride
+            )
+            self.cu_new_k1_token_nums_cpu = F.pad(
+                torch.cumsum(self.new_k1_token_nums_cpu, dim=0, dtype=torch.int32),
+                (1, 0),
+            )
+            self.cu_new_k2_token_nums_cpu = F.pad(
+                torch.cumsum(self.new_k2_token_nums_cpu, dim=0, dtype=torch.int32),
+                (1, 0),
+            )
+
+            self.new_compress_k1_token_nums_cpu = torch.maximum(
+                (self.new_k1_token_nums_cpu - k1_kernel_size) // k1_kernel_stride + 1,
+                torch.zeros(
+                    1, device=self.new_k1_token_nums_cpu.device, dtype=torch.int32
+                ),
+            )
+            self.new_compress_k2_token_nums_cpu = torch.maximum(
+                (self.new_k2_token_nums_cpu - k2_kernel_size) // k2_kernel_stride + 1,
+                torch.zeros(
+                    1, device=self.new_k2_token_nums_cpu.device, dtype=torch.int32
+                ),
+            )
+            self.cu_new_compress_k1_token_nums_cpu = F.pad(
+                torch.cumsum(
+                    self.new_compress_k1_token_nums_cpu, dim=0, dtype=torch.int32
+                ),
+                (1, 0),
+            )
+            self.cu_new_compress_k2_token_nums_cpu = F.pad(
+                torch.cumsum(
+                    self.new_compress_k2_token_nums_cpu, dim=0, dtype=torch.int32
+                ),
+                (1, 0),
+            )
+
+            self.total_compress_k1_token_nums_cpu = (
+                self.history_compress_k1_token_nums_cpu
+                + self.new_compress_k1_token_nums_cpu
+            )
+            self.total_compress_k2_token_nums_cpu = (
+                self.history_compress_k2_token_nums_cpu
+                + self.new_compress_k2_token_nums_cpu
+            )
+            self.cu_total_compress_k1_token_nums_cpu = F.pad(
+                torch.cumsum(
+                    self.total_compress_k1_token_nums_cpu, dim=0, dtype=torch.int32
+                ),
+                (1, 0),
+            )
+            self.cu_total_compress_k2_token_nums_cpu = F.pad(
+                torch.cumsum(
+                    self.total_compress_k2_token_nums_cpu, dim=0, dtype=torch.int32
+                ),
+                (1, 0),
+            )
+
+    def maybe_wait_verify_done(self):
+        if self.is_spec_v2:
+            draft_input: EagleDraftInput = self.spec_info
+            if draft_input.verify_done is not None:
+                draft_input.verify_done.synchronize()
 
     def filter_batch(
         self,
@@ -2786,6 +3076,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
+            sparse_k1_loc=self.sparse_k1_loc,
+            sparse_k2_loc=self.sparse_k2_loc,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,

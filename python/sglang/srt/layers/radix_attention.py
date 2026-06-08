@@ -124,6 +124,14 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
+        # Auto-pass sparse_metadata from forward_batch to backend if available.
+        # This allows backends like MiniCPMSparseBackend to use frontend-computed metadata.
+        if (
+            hasattr(forward_batch, "sparse_metadata")
+            and forward_batch.sparse_metadata is not None
+        ):
+            kwargs["sparse_metadata"] = forward_batch.sparse_metadata
+
         if (
             forward_batch.forward_mode.is_extend()
             and get_tc_piecewise_forward_context() is not None
