@@ -1,0 +1,59 @@
+# ============================================================
+# Dockerfile for MiniCPM-SALA Inference Environment
+# Base: nvcr.io/nvidia/pytorch:25.01-py3
+#   - CUDA 12.8, Python 3.12, PyTorch (pre-installed)
+#   - Ubuntu 24.04
+# ============================================================
+
+FROM nvcr.io/nvidia/pytorch:25.01-py3
+
+LABEL maintainer="Jiayi Li <hyleepp@gmail.com>"
+LABEL description="MiniCPM-SALA inference environment based on SGLang"
+
+# Avoid interactive prompts during apt install
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Ensure CUDA is available for compilation
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="${CUDA_HOME}/bin:${PATH}"
+ENV CUDACXX="${CUDA_HOME}/bin/nvcc"
+
+WORKDIR /workspace
+
+# ---- System Dependencies ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        build-essential \
+        ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Clone SGLang (minicpm_sala branch) ----
+RUN git clone -b minicpm_sala \
+        https://github.com/OpenBMB/sglang.git /workspace/sglang
+
+WORKDIR /workspace/sglang
+
+# ---- Install SGLang ----
+RUN pip install --no-cache-dir "cmake>=3.26" setuptools wheel \
+    && pip install --no-cache-dir -e "./python[all]"
+
+# ---- Build sgl-kernel (includes InfLLM v2 kernels) ----
+# InfLLM v2 kernels (max_pooling / bitmask / flash attention stage1) are part of
+# sgl-kernel. The sparse_kernel get_block_table ops live in sglang.jit_kernel and
+# are JIT-compiled at runtime, so no separate build step is required.
+# Use `make build` (wheel install) instead of `make install` (editable) so the
+# arch-specific common_ops .so files install alongside the imported package.
+RUN cd /workspace/sglang/sgl-kernel \
+    && make build
+
+# ---- Install Additional Libraries ----
+# flash-linear-attention pulls in kernels>=0.15, whose LayerRepository requires an
+# explicit revision/version and breaks `import sglang` (via transformers hub_kernels).
+# Pin back to a compatible release until upstream is fixed.
+RUN pip install --no-cache-dir tilelang flash-linear-attention \
+    && pip install --no-cache-dir "kernels<0.15"
+
+# ---- Default ----
+WORKDIR /workspace/sglang
+
+CMD ["/bin/bash"]
