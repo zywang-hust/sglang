@@ -50,6 +50,29 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
 
   /*
+   * From csrc/infllm_v2
+   */
+  m.def(
+      "infllm_v2_max_pooling_1d_varlen(Tensor input, Tensor! output, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
+      "Tensor cache_lens, int max_seqlen_q, int max_seqlen_k, int kernel_size, int stride, int padding, "
+      "int block_size, int local_blocks, int init_blocks, int total_q) -> ()");
+  m.impl("infllm_v2_max_pooling_1d_varlen", torch::kCUDA, &infllm_v2_max_pooling_1d_varlen);
+
+  m.def(
+      "infllm_v2_max_pooling_1d(Tensor input, Tensor! output, int cache_len, int kernel_size, int stride, "
+      "int padding, int block_size, int local_blocks, int init_blocks) -> ()");
+  m.impl("infllm_v2_max_pooling_1d", torch::kCUDA, &infllm_v2_max_pooling_1d);
+
+  m.def("infllm_v2_topk_to_uint64(Tensor! result, Tensor topk_idx) -> ()");
+  m.impl("infllm_v2_topk_to_uint64", torch::kCUDA, &infllm_v2_topk_to_uint64);
+
+  m.def("infllm_v2_uint64_to_bool(Tensor! result, Tensor input) -> ()");
+  m.impl("infllm_v2_uint64_to_bool", torch::kCUDA, &infllm_v2_uint64_to_bool);
+
+  m.def("infllm_v2_blockmask_to_uint64(Tensor! result, Tensor blockmask) -> ()");
+  m.impl("infllm_v2_blockmask_to_uint64", torch::kCUDA, &infllm_v2_blockmask_to_uint64);
+
+  /*
    * From csrc/elementwise
    */
   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");

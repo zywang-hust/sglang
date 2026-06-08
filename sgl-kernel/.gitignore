@@ -1,0 +1,9 @@
+# scikit-build-core persistent build cache (build/, dist/, *.so, *.log are
+# already covered by the repo-root .gitignore).
+.skbuild/
+
+# Local editable-install workaround symlinks. A proper `make build` (wheel
+# install) places the arch-specific common_ops .so files under site-packages,
+# so these directories should never exist in the source tree or be committed.
+/python/sgl_kernel/sm90
+/python/sgl_kernel/sm100
