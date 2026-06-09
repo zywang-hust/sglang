@@ -5,10 +5,16 @@
 #pragma once
 #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 
+// clang-format off
+// Pinned to mirror the bwd template, where preprocess-before-kernel IS
+// load-bearing (flash_bwd_preprocess_kernel.h defines flash::dot_do_o, called by
+// flash_bwd_kernel.h); the fwd build has no include-order dependency, but keeping
+// both blocks identical stops sglang's SortIncludes from regressing them apart.
+#include "static_switch.h"
+#include "hardware_info.h"
 #include "flash.h"
 #include "flash_fwd_kernel.h"
-#include "hardware_info.h"
-#include "static_switch.h"
+// clang-format on
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800

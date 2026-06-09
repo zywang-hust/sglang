@@ -480,6 +480,38 @@ endif()
 # stay isolated from sgl-kernel's own flash attention. Mirrors the original
 # setup.py: only hdim 64/128 bf16 instantiations are compiled (the vendored
 # static_switch.h forces bf16 and dispatches headdim to {64, 128} only).
+#
+# IMPORTANT: these are FlashAttention-2 sm80 kernels written against CUTLASS 3.x
+# CuTe. The main sgl-kernel pins CUTLASS 4.2 (repo-cutlass @ 57e3cfb), which
+# changed/removed the free-function CuTe symbols (size<>, Tensor, _, _0, ...)
+# these kernels use unqualified — building infllm against 4.2 yields ~1200
+# "identifier undefined" errors. openbmb's infllm vendored
+# GitHubstart0916/cutlass@18806714 (CUTLASS 3.6.0 + "Fix build with cuda 13.x").
+# Point ONLY infllm_ops at that tree; the main target stays on base-aligned 4.2.
+# Pass -DINFLLM_CUTLASS_DIR=... to use a local checkout instead of the pinned
+# archive.
+if(NOT DEFINED INFLLM_CUTLASS_DIR)
+    FetchContent_Declare(
+        repo-infllm-cutlass
+        URL      https://${GITHUB_ARTIFACTORY}/GitHubstart0916/cutlass/archive/18806714351c821fcdd08e5a03fb5be98a113ee5.tar.gz
+        URL_HASH SHA256=b4f8642ef27fe8814c9c149597a46e712a86f36e869645f99677f0373b3c763d
+    )
+    FetchContent_Populate(repo-infllm-cutlass)
+    set(INFLLM_CUTLASS_DIR "${repo-infllm-cutlass_SOURCE_DIR}")
+endif()
+if(NOT EXISTS "${INFLLM_CUTLASS_DIR}/include/cute/tensor.hpp"
+   OR NOT EXISTS "${INFLLM_CUTLASS_DIR}/include/cutlass/version.h")
+    message(FATAL_ERROR
+        "INFLLM_CUTLASS_DIR (${INFLLM_CUTLASS_DIR}) is not a CUTLASS 3.x tree "
+        "(missing include/cute/tensor.hpp or include/cutlass/version.h)")
+endif()
+file(READ "${INFLLM_CUTLASS_DIR}/include/cutlass/version.h" INFLLM_CUTLASS_VERSION_H)
+if(NOT INFLLM_CUTLASS_VERSION_H MATCHES "#define CUTLASS_MAJOR 3[^0-9]")
+    message(FATAL_ERROR
+        "INFLLM_CUTLASS_DIR (${INFLLM_CUTLASS_DIR}) must point to CUTLASS 3.x; "
+        "the vendored InfLLM FA2 kernels do not compile against the main "
+        "sgl-kernel CUTLASS 4.x tree.")
+endif()
 set(INFLLM_FLASH_CUDA_FLAGS
     "-DNDEBUG"
     "-O3"
@@ -531,8 +563,8 @@ set(INFLLM_FLASH_SOURCES
 Python_add_library(infllm_ops MODULE WITH_SOABI ${INFLLM_FLASH_SOURCES})
 target_compile_options(infllm_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${INFLLM_FLASH_CUDA_FLAGS}>)
 target_include_directories(infllm_ops PRIVATE
-    ${repo-cutlass_SOURCE_DIR}/include
-    ${repo-cutlass_SOURCE_DIR}/tools/util/include
+    ${INFLLM_CUTLASS_DIR}/include
+    ${INFLLM_CUTLASS_DIR}/tools/util/include
     ${CMAKE_CURRENT_LIST_DIR}/csrc/infllm_v2/flash_attn
     ${CMAKE_CURRENT_LIST_DIR}/csrc/infllm_v2/flash_attn/src
 )

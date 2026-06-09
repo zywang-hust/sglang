@@ -6,11 +6,17 @@
 
 #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 
-#include "flash.h"
-#include "flash_bwd_kernel.h"
-#include "flash_bwd_preprocess_kernel.h"
-#include "hardware_info.h"
+// clang-format off
+// FA2 include order is dependency-sensitive: static_switch/hardware_info must
+// come first, and the preprocess kernel (defines flash::dot_do_o) must precede
+// the bwd kernel that calls it. sglang's SortIncludes would alphabetise these
+// (kernel < preprocess) and break the build, so pin the manual order here.
 #include "static_switch.h"
+#include "hardware_info.h"
+#include "flash.h"
+#include "flash_bwd_preprocess_kernel.h"
+#include "flash_bwd_kernel.h"
+// clang-format on
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
