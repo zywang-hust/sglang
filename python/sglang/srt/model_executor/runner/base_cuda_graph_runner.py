@@ -59,7 +59,10 @@ def get_batch_sizes_to_capture(
     """
 
     server_args = model_runner.server_args
-    capture_bs = server_args.cuda_graph_config.decode.bs
+    # Copy: the `capture_bs += [...]` below must not mutate
+    # cuda_graph_config.decode.bs, which is shared across graph runners
+    # (target + EAGLE draft both build their capture lists from it).
+    capture_bs = list(server_args.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = 1
