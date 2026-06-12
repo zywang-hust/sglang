@@ -18,6 +18,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
+    alloc_sparse_compressed_slots_for_range,
     alloc_token_slots,
     get_alloc_reserve_per_decode,
     get_last_loc,
@@ -213,6 +214,23 @@ class EagleDraftInputV2Mixin:
             out_cache_loc,
             bs,
         )
+
+        if batch.model_config.has_sparse_attention:
+            (
+                batch.token_num_sparse_k1_cpu,
+                batch.token_num_sparse_k2_cpu,
+            ) = alloc_sparse_compressed_slots_for_range(
+                batch.tree_cache,
+                batch.req_to_token_pool,
+                [req.req_pool_idx for req in batch.reqs],
+                cur_kv_lens_cpu,
+                nxt_kv_lens_cpu,
+            )
+            # MiniCPM sparse decode reads seq_lens_cpu when building per-iter
+            # page tables, so keep the eager host sync that upstream made
+            # optional (gpu_only) for the non-sparse FutureMap path.
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,

@@ -20,7 +20,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
+    alloc_sparse_compressed_slots_for_range,
     alloc_token_slots,
+    free_sparse_compressed_slots_for_range,
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -168,6 +170,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.out_cache_loc,
             bs,
         )
+
+        if batch.model_config.has_sparse_attention:
+            end_lens_cpu = self.seq_lens_cpu + self.draft_token_num
+            (
+                batch.token_num_sparse_k1_cpu,
+                batch.token_num_sparse_k2_cpu,
+            ) = alloc_sparse_compressed_slots_for_range(
+                batch.tree_cache,
+                batch.req_to_token_pool,
+                [req.req_pool_idx for req in batch.reqs],
+                self.seq_lens_cpu,
+                end_lens_cpu,
+            )
 
         if get_global_server_args().enable_mamba_extra_buffer():
             batch.mamba_track_indices = torch.tensor(
@@ -516,6 +531,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # try to unify the tensor representation and list representation
         num_correct_drafts_list = num_correct_drafts_cpu.tolist()
         num_accept_tokens_list = num_accept_tokens_cpu.tolist()
+
+        if batch.model_config.has_sparse_attention:
+            pre_verify_seq_lens = self.seq_lens_cpu.tolist()
+            for req, start_len, num_accept_tokens in zip(
+                batch.reqs, pre_verify_seq_lens, num_accept_tokens_list
+            ):
+                free_sparse_compressed_slots_for_range(
+                    batch.tree_cache,
+                    req.req_pool_idx,
+                    start_len + num_accept_tokens,
+                    start_len + self.draft_token_num,
+                )
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionMetadata,
     )
+    from sglang.srt.layers.attention.minicpm_backend import MiniCPMBackendMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 import math
@@ -35,6 +36,40 @@ from sglang.srt.layers.attention.minicpm_sparse_kernels import (
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 logger = logging.getLogger(__name__)
+
+
+def sparse_block_quantized_count(
+    positions: torch.Tensor, block_size: int, sparse_topk: int
+) -> torch.Tensor:
+    """Number of sparse KV tokens visible to a query at each causal position.
+
+    This is the single source of truth for MiniCPM sparse "cache seqlens". Below
+    the sparse budget (``block_size * sparse_topk``) every key is visible, so the
+    count equals the position itself. Above the budget the sparse attention reads
+    ``sparse_topk`` blocks of ``block_size`` keys each; because the local window
+    forces the frontier (most recent) block to be selected, that frontier block
+    is the only partial one, giving ``(sparse_topk - 1)`` full blocks plus
+    ``position % block_size``.
+
+    Both the decode count precompute (``ScheduleBatch``, one count per request at
+    ``seq_len``) and the tree-verify CUDA-graph plan (``MiniCPMSparseBackend``, one per
+    draft token at its causal ``token_pos``) build on this; routing them through
+    one helper keeps their FlashInfer split-KV plans byte-identical to the data
+    the in-graph kernels write. Note this encodes the local-window-always-selected
+    invariant: if the sparse block-selection policy changes (window eviction,
+    dynamic window, non-flat draft layout), revisit here.
+
+    ``positions`` may be any integer tensor (CPU or CUDA); the result keeps its
+    dtype/device.
+    """
+    budget = block_size * sparse_topk
+    mod = positions % block_size
+    capped = torch.where(
+        mod == 0,
+        torch.full_like(positions, budget),
+        (sparse_topk - 1) * block_size + mod,
+    )
+    return torch.where(positions <= budget, positions, capped)
 
 
 def batched_gather(a, cu_seqlen_q, select):
@@ -55,6 +90,16 @@ def batched_gather(a, cu_seqlen_q, select):
     index = starts_expanded + local_offsets
 
     return a[index]
+
+
+def effective_seq_lens_cpu(
+    forward_batch: "ForwardBatch", base_metadata: "MiniCPMBackendMetadata"
+) -> torch.Tensor:
+    """Seq lens for sparse decisions; target verify overrides them with
+    prefix + draft lengths via ``seq_lens_cpu_for_sparse``."""
+    if base_metadata.seq_lens_cpu_for_sparse is not None:
+        return base_metadata.seq_lens_cpu_for_sparse
+    return forward_batch.seq_lens_cpu
 
 
 def compress_k_core_new(
@@ -785,49 +830,6 @@ class CompressionLevelMetadata:
 
 
 @dataclass
-class SparseMetadata:
-    """Metadata for sparse attention in a forward batch.
-
-    This dataclass contains all metadata required for sparse attention processing,
-    including sequence lengths, cumulative sequence lengths, page tables,
-    and token mapping information.
-
-    The metadata is computed once per forward batch and reused across layers.
-    """
-
-    # Flag indicating whether sparse attention is enabled for this batch
-    sparse_enabled: bool = False
-
-    # Sequence length metadata
-    sparse_cache_seqlens_int32: Optional[torch.Tensor] = None
-    sparse_max_seq_len_q: int = 1
-    sparse_max_seq_len_k: int = 0
-    sparse_cu_seqlens_q: Optional[torch.Tensor] = None
-    sparse_cu_seqlens_k: Optional[torch.Tensor] = None
-
-    # Compression level metadata (k1 and k2)
-    k1: CompressionLevelMetadata = field(default_factory=CompressionLevelMetadata)
-    k2: CompressionLevelMetadata = field(default_factory=CompressionLevelMetadata)
-
-    # Page table for sparse attention
-    sparse_page_table: Optional[torch.Tensor] = None
-
-    # Token mapping for sparse attention
-    token_to_bs: Optional[torch.Tensor] = None
-    token_pos_in_bs: Optional[torch.Tensor] = None
-    seqlen_q_sparse_bs_tensor: Optional[torch.Tensor] = None
-    seqlen_k_sparse_bs_tensor: Optional[torch.Tensor] = None
-
-    # TopK indices for sparse attention (computed by frontend)
-    topk_indices: Optional[torch.Tensor] = None
-
-    # Chunk prefill metadata
-    sparse_bs_list: Optional[list] = None
-    old_bs_to_new_bs_range: Optional[torch.Tensor] = None
-    sparse_cu_seqlens_q_cpu: Optional[torch.Tensor] = None
-
-
-@dataclass
 class SparseConfig:
     """Configuration for sparse attention in MiniCPM models.
 
@@ -836,7 +838,7 @@ class SparseConfig:
     architecture parameters.
 
     The configuration is derived from the model's hf_config and
-    model_config, and is used by SparseBatchAnalyzer to compute
+    model_config, and is used by SparseMetadataBuilder to compute
     metadata for sparse attention batches.
     """
 
@@ -920,90 +922,14 @@ class SparseConfig:
         )
 
 
-class SparseBatchAnalyzer:
-    """Analyzer for identifying batches that need sparse attention.
-
-    This helper class analyzes a forward batch and identifies which
-    batches (requests) have sequences long enough to trigger sparse
-    attention processing.
-
-    A batch is considered sparse if its sequence length is >= dense_len.
-    """
-
-    def __init__(self, config: SparseConfig):
-        """Initialize SparseBatchAnalyzer with sparse configuration.
-
-        Args:
-            config: SparseConfig containing dense_len threshold
-        """
-        self.config = config
-
-    def identify_sparse_batches(
-        self, forward_batch: ForwardBatch, dense_as_sparse: bool
-    ) -> list[int]:
-        """Identify sparse batches in the forward batch.
-
-        A batch is considered sparse if its sequence length is >= dense_len.
-
-        Args:
-            forward_batch: The forward batch to analyze
-            dense_as_sparse: Whether to treat dense batches as sparse
-
-        Returns:
-            List of batch indices that need sparse attention processing.
-            For example: [0, 2, 5] means batches 0, 2, and 5 are sparse.
-        """
-        sparse_bs_list = []
-        batch_size = forward_batch.batch_size
-
-        for i in range(batch_size):
-            # Check if sequence length exceeds dense_len threshold
-            if (
-                forward_batch.seq_lens_cpu[i] >= self.config.dense_len
-                or dense_as_sparse
-            ):
-                sparse_bs_list.append(i)
-
-        return sparse_bs_list
-
-    def is_sparse_batch(
-        self, batch_idx: int, forward_batch: ForwardBatch, dense_as_sparse: bool
-    ) -> bool:
-        """Check if a specific batch index needs sparse attention.
-
-        Args:
-            batch_idx: The batch index to check
-            forward_batch: The forward batch containing the batch
-
-        Returns:
-            True if the batch needs sparse attention, False otherwise
-        """
-        return bool(
-            forward_batch.seq_lens_cpu[batch_idx] >= self.config.dense_len
-            or dense_as_sparse
-        )
-
-    def get_sparse_batch_count(self, forward_batch: ForwardBatch) -> int:
-        """Get the count of sparse batches in the forward batch.
-
-        Args:
-            forward_batch: The forward batch to analyze
-
-        Returns:
-            Number of sparse batches
-        """
-        sparse_bs_list = self.identify_sparse_batches(forward_batch)
-        return len(sparse_bs_list)
-
-
 class SparseMetadataBuilder:
     """Builder for constructing sparse attention metadata.
 
     This helper class builds the metadata required for sparse attention processing,
     including sequence lengths, token mappings, and page tables.
 
-    The metadata is computed from the forward batch and batch indices identified
-    by SparseBatchAnalyzer as needing sparse attention.
+    The metadata is computed from the forward batch and the sparse batch
+    indices selected by the backend.
     """
 
     def __init__(
@@ -1022,45 +948,30 @@ class SparseMetadataBuilder:
     def build_sequence_lengths(
         self,
         cu_seqlens_q: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
         sparse_bs_list: list[int],
-    ) -> tuple[list[int], torch.Tensor]:
-        """Build sequence lengths for sparse batches.
+    ) -> list[int]:
+        """Per-sparse-request query lengths for the sparse token mapping.
 
-        Computes seqlen_q_sparse_bs (query sequence lengths) and
-        seqlen_k_sparse_bs_tensor (key sequence lengths as tensor).
+        Only the query lengths are returned. The key lengths the block-table
+        kernel needs are full-batch (indexed by the original request id carried
+        in token_to_bs, not the sparse subset) and equal the full cache seqlens,
+        so the caller aliases cache_seqlens_int32 for them instead.
 
         Args:
-            cu_seqlens_q: Cumulative sequence lengths for all batches
-            extend_prefix_lens: Extension prefix lengths tensor
+            cu_seqlens_q: Cumulative query sequence lengths for all batches
             sparse_bs_list: List of batch indices that are sparse
 
         Returns:
-            Tuple of (seqlen_q_sparse_bs, seqlen_k_sparse_bs_tensor)
-            - seqlen_q_sparse_bs: Python list of query sequence lengths
-            - seqlen_k_sparse_bs_tensor: Tensor of key sequence lengths
+            seqlen_q_sparse_bs: Python list of per-sparse-request query lengths
         """
-        # Extract query sequence lengths for sparse batches
-        # Using cu_seqlens_q.diff() to get sequence length for each batch
-        seqlen_q_sparse_bs = cu_seqlens_q.diff()[sparse_bs_list].tolist()
-
-        # Create tensor version with prefix lengths added (for key)
-        seqlen_k_sparse_bs_tensor = (
-            torch.tensor(
-                seqlen_q_sparse_bs,
-                dtype=torch.int32,
-                device=cu_seqlens_q.device,
-            )
-            + extend_prefix_lens[sparse_bs_list]
-        )
-
-        return seqlen_q_sparse_bs, seqlen_k_sparse_bs_tensor
+        return cu_seqlens_q.diff()[sparse_bs_list].tolist()
 
     def build_token_mappings(
         self,
         cu_seqlens_q_sparse_bs: torch.Tensor,
         extend_prefix_lens_sparse: torch.Tensor,
         seqlen_q_sparse_bs: list[int],
+        sparse_bs_list: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build token mapping tensors for sparse batches.
 
@@ -1074,7 +985,7 @@ class SparseMetadataBuilder:
 
         Returns:
             Tuple of (token_to_bs, token_pos_in_bs)
-            - token_to_bs: Tensor mapping each token to its batch index
+            - token_to_bs: Tensor mapping each token to its original batch index
             - token_pos_in_bs: Tensor mapping each token to its position within batch
         """
         # Total number of tokens in sparse batches
@@ -1082,10 +993,17 @@ class SparseMetadataBuilder:
 
         # Build token_to_bs: which batch each token belongs to
         token_to_bs = torch.zeros(q_shape_sparse_bs, dtype=torch.int32, device="cpu")
+        if sparse_bs_list is None:
+            sparse_bs_list = list(range(len(seqlen_q_sparse_bs)))
+        elif len(sparse_bs_list) != len(seqlen_q_sparse_bs):
+            raise ValueError(
+                "sparse_bs_list must have the same length as seqlen_q_sparse_bs; "
+                f"got {len(sparse_bs_list)} and {len(seqlen_q_sparse_bs)}."
+            )
         for i in range(len(seqlen_q_sparse_bs)):
             start = cu_seqlens_q_sparse_bs[i]
             end = cu_seqlens_q_sparse_bs[i + 1]
-            token_to_bs[start:end] = i
+            token_to_bs[start:end] = sparse_bs_list[i]
 
         # Build token_pos_in_bs: position of each token within its batch
         token_pos_in_bs = torch.zeros(
@@ -1104,23 +1022,6 @@ class SparseMetadataBuilder:
             )
 
         return token_to_bs, token_pos_in_bs
-
-    def build_page_table_base(
-        self, sparse_bs_list: list[int], base_metadata: object
-    ) -> torch.Tensor:
-        """Build page table reference for sparse batches.
-
-        This method returns a reference to the sparse page table from the base metadata.
-        The page table is not modified or filtered - this is a zero-copy reference.
-
-        Args:
-            sparse_bs_list: List of batch indices that are sparse (not used but kept for consistency)
-            base_metadata: Base metadata containing sparse_page_table
-
-        Returns:
-            Reference to the sparse page table tensor
-        """
-        return base_metadata.sparse_page_table
 
     def _compute_single_compression_metadata(
         self,
@@ -1145,6 +1046,7 @@ class SparseMetadataBuilder:
             Dictionary with compression metadata fields for this level
         """
         bs = forward_batch.batch_size
+        seq_lens_cpu_for_sparse = effective_seq_lens_cpu(forward_batch, base_metadata)
         seqlen_cpu = torch.zeros(
             (bs,), dtype=base_metadata.cu_seqlens_q.dtype, device="cpu"
         )
@@ -1158,9 +1060,10 @@ class SparseMetadataBuilder:
             #         + 1,
             #     )
             # else:
+            seq_len_i = int(seq_lens_cpu_for_sparse[i])
             seqlen_cpu[i] = max(
                 0,
-                (forward_batch.seq_lens_cpu[i] - kernel_size) // kernel_stride + 1,
+                (seq_len_i - kernel_size) // kernel_stride + 1,
             )
 
         max_seq_len = seqlen_cpu.max().item()
@@ -1307,6 +1210,7 @@ class SparseMetadataBuilder:
         cu_seqlens_q: torch.Tensor,
         sparse_page_table_dtype: torch.dtype,
         sparse_page_table_device: torch.device,
+        tree_mode: bool = False,
     ) -> dict:
         """Build sparse prefill metadata.
 
@@ -1324,11 +1228,17 @@ class SparseMetadataBuilder:
             cu_seqlens_q: Cumulative query sequence lengths
             sparse_page_table_dtype: Data type for sparse page table
             sparse_page_table_device: Device for sparse page table
+            tree_mode: When True (topk>1 target verify), dense requests also use
+                the token-major row layout so the whole batch is uniform and the
+                tree compaction kernel can run over every row. Their compacted
+                rows are filled separately (full prefix + tree-visible drafts);
+                the page table is only widened to hold each dense prefix.
 
         Returns:
             Dictionary with prefill metadata
         """
         bs = forward_batch.batch_size
+        seq_lens_cpu_for_sparse = effective_seq_lens_cpu(forward_batch, base_metadata)
 
         max_sparse_cache_len = -1
         sparse_page_table_bs = 0
@@ -1336,7 +1246,8 @@ class SparseMetadataBuilder:
         sparse_max_seq_len_q = 1
 
         for i in range(bs):
-            if forward_batch.seq_lens_cpu[i] >= dense_len:
+            seq_len_i = int(seq_lens_cpu_for_sparse[i])
+            if seq_len_i >= dense_len:
                 max_sparse_cache_len = max(
                     max_sparse_cache_len, sparse_topk * block_size
                 )
@@ -1347,10 +1258,19 @@ class SparseMetadataBuilder:
                     old_bs_to_new_bs_range[i]
                     + head_group_num * forward_batch.extend_seq_lens_cpu[i]
                 )
-            else:
-                max_sparse_cache_len = max(
-                    max_sparse_cache_len, forward_batch.extend_seq_lens_cpu[i]
+            elif tree_mode:
+                # Dense request under tree verify: token-major like a sparse
+                # request, but the page table must hold its full prefix.
+                max_sparse_cache_len = max(max_sparse_cache_len, seq_len_i)
+                sparse_page_table_bs += (
+                    forward_batch.extend_seq_lens_cpu[i] * head_group_num
                 )
+                old_bs_to_new_bs_range[i + 1] = (
+                    old_bs_to_new_bs_range[i]
+                    + head_group_num * forward_batch.extend_seq_lens_cpu[i]
+                )
+            else:
+                max_sparse_cache_len = max(max_sparse_cache_len, seq_len_i)
                 sparse_page_table_bs += head_group_num
                 old_bs_to_new_bs_range[i + 1] = (
                     old_bs_to_new_bs_range[i] + head_group_num
@@ -1370,7 +1290,8 @@ class SparseMetadataBuilder:
 
         pt = 0
         for i in range(bs):
-            if forward_batch.seq_lens_cpu[i] >= dense_len:
+            seq_len_i = int(seq_lens_cpu_for_sparse[i])
+            if seq_len_i >= dense_len or tree_mode:
                 for _ in range(forward_batch.extend_seq_lens_cpu[i] * head_group_num):
                     sparse_cu_seqlens_q_cpu[pt + 1] = sparse_cu_seqlens_q_cpu[pt] + 1
                     pt += 1
@@ -1489,70 +1410,6 @@ class SparseMetadataBuilder:
             "token_to_bs": token_to_bs,
         }
 
-    def build(
-        self, forward_batch: ForwardBatch, base_metadata: object
-    ) -> SparseMetadata:
-        """Build complete sparse metadata for the forward batch.
-
-        This method orchestrates the entire metadata building process:
-        1. Identify sparse batches
-        2. Build sequence lengths
-        3. Build token mappings
-        4. Get page table from base metadata
-
-        Args:
-            forward_batch: The forward batch to build metadata for
-            base_metadata: Base metadata containing page_table, cu_seqlens_q, etc.
-
-        Returns:
-            SparseMetadata instance with all fields populated
-        """
-        # Identify sparse batches
-        analyzer = SparseBatchAnalyzer(self.config)
-        sparse_bs_list = analyzer.identify_sparse_batches(forward_batch)
-
-        # Build sequence lengths
-        seqlen_q_sparse_bs, seqlen_k_sparse_bs_tensor = self.build_sequence_lengths(
-            base_metadata.cu_seqlens_q, forward_batch.extend_prefix_lens, sparse_bs_list
-        )
-
-        # Build cumulative sequence lengths for sparse batches
-        cu_seqlens_q_sparse_bs_cpu = torch.tensor(
-            [0] + seqlen_q_sparse_bs,
-            dtype=torch.int32,
-            device="cpu",
-        ).cumsum(dtype=torch.int32, dim=0)
-
-        # Extract prefix lengths for sparse batches only
-        extend_prefix_lens_sparse = forward_batch.extend_prefix_lens_cpu[sparse_bs_list]
-
-        # Build token mappings
-        token_to_bs, token_pos_in_bs = self.build_token_mappings(
-            cu_seqlens_q_sparse_bs_cpu, extend_prefix_lens_sparse, seqlen_q_sparse_bs
-        )
-
-        # Get page table
-        sparse_page_table = self.build_page_table_base(sparse_bs_list, base_metadata)
-
-        # Create SparseMetadata instance
-        metadata = SparseMetadata(
-            sparse_bs_list=sparse_bs_list,
-            sparse_cu_seqlens_q_cpu=cu_seqlens_q_sparse_bs_cpu,
-            seqlen_q_sparse_bs_tensor=torch.tensor(
-                seqlen_q_sparse_bs,
-                dtype=torch.int32,
-                device=forward_batch.cu_seqlens_q.device,
-            ),
-            seqlen_k_sparse_bs_tensor=seqlen_k_sparse_bs_tensor,
-            token_to_bs=token_to_bs,
-            token_pos_in_bs=token_pos_in_bs,
-            sparse_page_table=sparse_page_table,
-            sparse_max_seq_len_q=max(seqlen_q_sparse_bs),
-            sparse_max_seq_len_k=max(seqlen_q_sparse_bs),
-        )
-
-        return metadata
-
     def build_prefill_topk_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -1591,8 +1448,9 @@ class SparseMetadataBuilder:
         bs, seqlens_q, seqlens_k = (
             forward_batch.batch_size,
             forward_batch.extend_seq_lens_cpu,
-            forward_batch.seq_lens_cpu,
+            effective_seq_lens_cpu(forward_batch, base_metadata),
         )
+        seqlens_k_list = [int(seq_len) for seq_len in seqlens_k]
 
         token_num_sparse_k1_total = [
             (
@@ -1600,7 +1458,7 @@ class SparseMetadataBuilder:
                 if seq_len >= compress_k1_kernel_size
                 else 0
             )
-            for seq_len in forward_batch.seq_lens_cpu
+            for seq_len in seqlens_k_list
         ]
         k1_lens = torch.tensor(token_num_sparse_k1_total, dtype=torch.int64)
 
@@ -1610,7 +1468,7 @@ class SparseMetadataBuilder:
                 if seq_len >= compress_k2_kernel_size
                 else 0
             )
-            for seq_len in forward_batch.seq_lens_cpu
+            for seq_len in seqlens_k_list
         ]
         k2_lens = torch.tensor(token_num_sparse_k2_total, dtype=torch.int64)
 
@@ -1619,10 +1477,10 @@ class SparseMetadataBuilder:
         seqlens_k_sparse_bs = []
 
         for i in range(bs):
-            if seqlens_k[i] >= dense_len:
+            if seqlens_k_list[i] >= dense_len:
                 sparse_bs.append(i)
                 seqlens_q_sparse_bs.append(seqlens_q[i])
-                seqlens_k_sparse_bs.append(seqlens_k[i].item())
+                seqlens_k_sparse_bs.append(seqlens_k_list[i])
 
         cu_seqlens_q = torch.cumsum(
             torch.tensor(
@@ -1699,9 +1557,7 @@ class SparseMetadataBuilder:
 
 __all__ = [
     "CompressionLevelMetadata",
-    "SparseMetadata",
     "SparseConfig",
-    "SparseBatchAnalyzer",
     "SparseMetadataBuilder",
     "batched_gather",
     "get_compress_k_v2",

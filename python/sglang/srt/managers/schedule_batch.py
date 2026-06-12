@@ -2472,10 +2472,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_tokens = ceil_align(spec_tokens, page_size)
 
         num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
+        num_tokens += len(requests) * self._sparse_compressed_slots_per_req(spec_tokens)
         return num_tokens
 
+    def _sparse_compressed_slots_per_req(self, new_tokens: int) -> int:
+        """Upper bound on the MiniCPM K1/K2 compressed slots a request growing
+        by `new_tokens` allocates. The spec verify path draws them from the
+        same token allocator (alloc_sparse_compressed_slots_for_range), so the
+        decode memory check must count them or the verify-round alloc can
+        raise after the check passed."""
+        pool = self.req_to_token_pool
+        if new_tokens <= 0 or getattr(pool, "req_to_sparse_k1_token", None) is None:
+            return 0
+        k1_stride = pool.kernel_stride
+        return (new_tokens // k1_stride + 1) + (new_tokens // (k1_stride * 4) + 1)
+
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
-        """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
+        """Tight estimate matching eagle_info_v2.prepare_for_decode allocation
+        (KV slots exactly; MiniCPM sparse compressed slots as an upper bound)."""
         reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
@@ -2483,6 +2497,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             cur = r.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
+            total += self._sparse_compressed_slots_per_req(x)
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
@@ -2775,19 +2790,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if is_sparse_minicpm:
             # sparse minicpm
 
+            # Lazy import: minicpm_sparse_utils requires tilelang and the
+            # compiled sgl_kernel extension at module scope.
+            from sglang.srt.layers.attention.minicpm_sparse_utils import (
+                sparse_block_quantized_count,
+            )
+
             topk = self.model_config.sparse_topk
             block_size = self.model_config.sparse_block_size
             window_size = self.model_config.sparse_window_size
             sparse_topk = topk + (window_size // block_size)
-            num_sparse_topk_tokens = block_size * sparse_topk
 
             k1_kernel_size = self.model_config.sparse_kernel_size
             k1_kernel_stride = self.model_config.sparse_kernel_stride
             k2_kernel_size = k1_kernel_size * 4
             k2_kernel_stride = k1_kernel_stride * 4
 
-            seq_lens_cpu = self.seq_lens.to(device="cpu")
-            mod_block_size_cpu = seq_lens_cpu % block_size
             cu_seqlens_k_cpu = F.pad(
                 torch.cumsum(self.seq_lens_cpu, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -2795,15 +2813,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device="cpu"
             )
 
-            sparse_cache_seqlens_cpu_t = torch.where(
-                mod_block_size_cpu == 0,
-                num_sparse_topk_tokens,
-                (sparse_topk - 1) * block_size + mod_block_size_cpu,
-            )
-            sparse_cache_seqlens_cpu = torch.where(
-                seq_lens_cpu <= num_sparse_topk_tokens,
-                seq_lens_cpu,
-                sparse_cache_seqlens_cpu_t,
+            sparse_cache_seqlens_cpu = sparse_block_quantized_count(
+                self.seq_lens_cpu, block_size, sparse_topk
             )
 
             self.sparse_cache_seqlens_int32_cpu = torch.repeat_interleave(
@@ -2817,9 +2828,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 (1, 0),
             )
 
-            self.cache_seqlens_int32_cpu = self.seq_lens.to(
-                dtype=torch.int32, device="cpu"
-            )
+            self.cache_seqlens_int32_cpu = self.seq_lens_cpu.to(torch.int32)
             self.cache_seqlens_int32_stage1_cpu = self.seq_lens_cpu - 1
 
             self.seqlens_k1_cpu = (

@@ -208,10 +208,6 @@ class FlashInferKernel(AttentionKernel):
         self.decode_wrapper: Optional[BatchDecodeWithPagedKVCacheWrapper] = None
         self.prefill_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
 
-        # Track if wrappers have been pre-planned for CUDA graph
-        self.decode_wrapper_planned = False
-        self.prefill_wrapper_planned = False
-
     def _get_or_create_decode_wrapper(
         self,
     ) -> "BatchDecodeWithPagedKVCacheWrapper":
@@ -241,85 +237,15 @@ class FlashInferKernel(AttentionKernel):
             )
         return self.prefill_wrapper
 
-    def plan_decode_wrapper(
-        self,
-        kv_indptr: torch.Tensor,
-        kv_indices: torch.Tensor,
-        kv_last_page_len: torch.Tensor,
-    ) -> None:
-        """Pre-plan the decode wrapper for CUDA graph compatibility.
-
-        This method calls begin_forward with the given metadata to set up
-        the flashinfer plan without calling forward. This must be called
-        before CUDA graph capture.
-
-        Args:
-            kv_indptr: Indptr array for the sparse indices
-            kv_indices: Flattened page indices
-            kv_last_page_len: Last page length for each sequence
-        """
-        self.decode_wrapper_planned = False
-        self._get_or_create_decode_wrapper()
-        self.decode_wrapper.begin_forward(
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            self.page_size,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
-            non_blocking=True,
-        )
-        self.decode_wrapper_planned = True
-
-    def plan_prefill_wrapper(
-        self,
-        qo_indptr: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        kv_indices: torch.Tensor,
-        kv_last_page_len: torch.Tensor,
-        causal: bool,
-    ) -> None:
-        """Pre-plan the prefill wrapper for CUDA graph compatibility.
-
-        This method calls begin_forward with the given metadata to set up
-        the flashinfer plan without calling forward. This must be called
-        before CUDA graph capture.
-
-        Args:
-            qo_indptr: Query indptr
-            kv_indptr: Indptr array for the sparse indices
-            kv_indices: Flattened page indices
-            kv_last_page_len: Last page length for each sequence
-            causal: Whether to apply causal masking
-        """
-        self.prefill_wrapper_planned = False
-        self._get_or_create_prefill_wrapper()
-        self.prefill_wrapper.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            self.page_size,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
-            non_blocking=True,
-            causal=causal,
-        )
-        self.prefill_wrapper_planned = True
-
     def forward(
         self,
         params: AttentionParams,
         layer: RadixAttention,
     ) -> torch.Tensor:
         """Perform attention computation using flashinfer."""
-        # Determine if this is prefill or decode based on max_seqlen_q
+        # Sparse tree verify encodes causal/tree visibility in the compacted
+        # sparse page table (no per-row custom mask), so attention only needs
+        # the standard prefill/decode split by query length.
         is_prefill = params.max_seqlen_q > 1
 
         # CUDA graph mode: use the pre-configured wrapper from params
@@ -423,6 +349,9 @@ class FlashInferKernel(AttentionKernel):
             # This is required by flashinfer to cache data types and metadata
             # Skip only if we're using pre-converted tensors that match the plan
             using_preconverted = params.flashinfer_kv_indptr is not None
+            num_qo_heads = params.q.shape[1]
+            num_kv_heads = params.k_cache.shape[2]
+
             if is_prefill:
                 if not using_preconverted:
                     # Prefill wrapper requires qo_indptr (query indptr)
@@ -432,8 +361,8 @@ class FlashInferKernel(AttentionKernel):
                         kv_indptr,
                         kv_indices,
                         kv_last_page_len,
-                        self.num_qo_heads,
-                        self.num_kv_heads,
+                        num_qo_heads,
+                        num_kv_heads,
                         self.head_dim,
                         self.page_size,
                         q_data_type=self.q_data_type,
@@ -448,8 +377,8 @@ class FlashInferKernel(AttentionKernel):
                         kv_indptr,
                         kv_indices,
                         kv_last_page_len,
-                        self.num_qo_heads,
-                        self.num_kv_heads,
+                        num_qo_heads,
+                        num_kv_heads,
                         self.head_dim,
                         self.page_size,
                         q_data_type=self.q_data_type,

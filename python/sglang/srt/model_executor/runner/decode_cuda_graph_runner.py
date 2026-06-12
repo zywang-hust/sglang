@@ -521,6 +521,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def can_run(self, forward_batch: ForwardBatch):
         if forward_batch.replace_embeds is not None:
             return False
+        # Let an attention backend veto the graph for a specific batch it cannot
+        # represent under a captured (static) shape (e.g. MiniCPM mixed
+        # sparse/dense topk>1 target verify), falling back to eager.
+        needs_eager = getattr(self.attn_backend, "verify_batch_needs_eager", None)
+        if needs_eager is not None and needs_eager(forward_batch):
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs

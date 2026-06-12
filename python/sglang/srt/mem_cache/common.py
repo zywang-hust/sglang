@@ -122,13 +122,7 @@ def write_cache_indices(
     for i in range(bs):
         req_idx = req_pool_indices_cpu[i].item()
         prefix_len = prefix_lens_cpu[i].item()
-        k1_len = (
-            (prefix_len - kernel_size) // kernel_stride + 1
-            if kernel_size is not None
-            and kernel_stride > 0
-            and prefix_len >= kernel_size
-            else 0
-        )
+        k1_len = _compressed_token_count(prefix_len, kernel_size, kernel_stride)
         if k1_len > 0:
             req_to_token_pool.write_sparse_k1(
                 (req_idx, slice(0, k1_len)),
@@ -146,13 +140,7 @@ def write_cache_indices(
     for i in range(bs):
         req_idx = req_pool_indices_cpu[i].item()
         prefix_len = prefix_lens_cpu[i].item()
-        k2_len = (
-            (prefix_len - k2_kernel_size) // k2_kernel_stride + 1
-            if k2_kernel_size is not None
-            and k2_kernel_stride > 0
-            and prefix_len >= k2_kernel_size
-            else 0
-        )
+        k2_len = _compressed_token_count(prefix_len, k2_kernel_size, k2_kernel_stride)
         if k2_len > 0:
             req_to_token_pool.write_sparse_k2(
                 (req_idx, slice(0, k2_len)),
@@ -164,6 +152,137 @@ def write_cache_indices(
                 sparse_k2_loc[pt : pt + token_num_sparse_k2_cpu[i]].to(torch.int32),
             )
             pt += token_num_sparse_k2_cpu[i]
+
+
+def _compressed_token_count(
+    seq_len: int, kernel_size: Optional[int], kernel_stride: Optional[int]
+) -> int:
+    if (
+        kernel_size is None
+        or kernel_stride is None
+        or kernel_stride <= 0
+        or seq_len < kernel_size
+    ):
+        return 0
+    return (seq_len - kernel_size) // kernel_stride + 1
+
+
+def _to_int_list(values) -> list[int]:
+    if isinstance(values, torch.Tensor):
+        return [int(v) for v in values.tolist()]
+    return [int(v) for v in values]
+
+
+def _pool_has_sparse_compressed_cache(req_to_token_pool) -> bool:
+    """The pool carries addressable MiniCPM K1/K2 compressed-key tables."""
+    return (
+        getattr(req_to_token_pool, "req_to_sparse_k1_token", None) is not None
+        and getattr(req_to_token_pool, "req_to_sparse_k2_token", None) is not None
+        and getattr(req_to_token_pool, "kernel_size", None) is not None
+        and getattr(req_to_token_pool, "kernel_stride", None) is not None
+    )
+
+
+def alloc_sparse_compressed_slots_for_range(
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    req_pool_indices,
+    start_lens,
+    end_lens,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate MiniCPM sparse K1/K2 slots for a logical token range.
+
+    Normal speculative decode over-allocates future KV slots by logical length. MiniCPM
+    sparse attention needs the matching compressed-cache slots registered in the
+    request table before target verify builds compression metadata.
+
+    Release protocols differ by spec path. The v1 EAGLE worker allocates
+    [seq_len, seq_len + draft_token_num) each verify round and trims the
+    rejected tail right after sampling (free_sparse_compressed_slots_for_range
+    in `EagleVerifyInput.sample`). The v2 worker allocates monotonically from
+    `kv_allocated_len`, reuses rejected slots in place on later rounds, and
+    releases the whole [committed, allocated) tail once when the request
+    leaves (`release_kv_cache`); a per-round free here would free slots later
+    rounds still address.
+
+    Returns the per-request K1/K2 slot counts (CPU int64). The slot ids are
+    written into the request tables here; callers do not need them.
+    """
+    start_lens = _to_int_list(start_lens)
+    end_lens = _to_int_list(end_lens)
+    req_pool_indices = _to_int_list(req_pool_indices)
+
+    if not _pool_has_sparse_compressed_cache(req_to_token_pool):
+        zeros = torch.zeros(len(start_lens), dtype=torch.int64)
+        return zeros, zeros
+
+    kernel_size = req_to_token_pool.kernel_size
+    kernel_stride = req_to_token_pool.kernel_stride
+    levels = (
+        (kernel_size, kernel_stride, req_to_token_pool.write_sparse_k1),
+        (kernel_size * 4, kernel_stride * 4, req_to_token_pool.write_sparse_k2),
+    )
+
+    level_starts = []
+    level_counts = []
+    for level_kernel_size, level_kernel_stride, _ in levels:
+        starts = [
+            _compressed_token_count(seq_len, level_kernel_size, level_kernel_stride)
+            for seq_len in start_lens
+        ]
+        counts = [
+            _compressed_token_count(seq_len, level_kernel_size, level_kernel_stride)
+            - start
+            for seq_len, start in zip(end_lens, starts)
+        ]
+        level_starts.append(starts)
+        level_counts.append(counts)
+
+    # One allocation covers both levels: a failure (alloc_token_slots raises
+    # on OOM) cannot leave one level allocated or any table row half written.
+    total = sum(level_counts[0]) + sum(level_counts[1])
+    loc = alloc_token_slots(tree_cache, total) if total > 0 else None
+
+    pt = 0
+    for (_, _, write_sparse), starts, counts in zip(levels, level_starts, level_counts):
+        for req_idx, start, count in zip(req_pool_indices, starts, counts):
+            if count == 0:
+                continue
+            write_sparse(
+                (req_idx, slice(start, start + count)),
+                loc[pt : pt + count].to(torch.int32),
+            )
+            pt += count
+
+    return (
+        torch.tensor(level_counts[0], dtype=torch.int64),
+        torch.tensor(level_counts[1], dtype=torch.int64),
+    )
+
+
+def free_sparse_compressed_slots_for_range(
+    tree_cache: BasePrefixCache,
+    req_pool_idx: int,
+    start_len: int,
+    end_len: int,
+) -> None:
+    req_to_token_pool = tree_cache.req_to_token_pool
+    if start_len >= end_len or not _pool_has_sparse_compressed_cache(req_to_token_pool):
+        return
+    kernel_size = req_to_token_pool.kernel_size
+    kernel_stride = req_to_token_pool.kernel_stride
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    for level_kernel_size, level_kernel_stride, req_to_sparse_token in (
+        (kernel_size, kernel_stride, req_to_token_pool.req_to_sparse_k1_token),
+        (kernel_size * 4, kernel_stride * 4, req_to_token_pool.req_to_sparse_k2_token),
+    ):
+        start = _compressed_token_count(
+            start_len, level_kernel_size, level_kernel_stride
+        )
+        end = _compressed_token_count(end_len, level_kernel_size, level_kernel_stride)
+        if start < end:
+            allocator.free(req_to_sparse_token[req_pool_idx, start:end])
 
 
 def get_last_loc(
@@ -661,6 +780,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()
+    # Compressed K1/K2 slots are indexed by logical (unpaged) token count, so
+    # their free range must use the pre-page-alignment start.
+    sparse_start_p = start_p
 
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
@@ -681,6 +803,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             start_p:end_p
         ]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+    free_sparse_compressed_slots_for_range(
+        tree_cache, req.req_pool_idx, sparse_start_p, end_p
+    )
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
