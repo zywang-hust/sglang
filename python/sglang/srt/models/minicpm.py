@@ -14,7 +14,7 @@
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
 import math
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -531,6 +531,7 @@ class MiniCPMModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
 
     def forward(
         self,
@@ -538,14 +539,17 @@ class MiniCPMModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
         else:
             hidden_states = input_embeds
         residual = None
 
+        aux_hidden_states = []
         for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -553,8 +557,12 @@ class MiniCPMModel(nn.Module):
                 forward_batch,
                 residual,
             )
+        if len(self.layers) in self.layers_to_capture:
+            aux_hidden_states.append(hidden_states)
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class MiniCPMSALAForCausalLM(nn.Module):
@@ -566,6 +574,7 @@ class MiniCPMSALAForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.capture_aux_hidden_states = False
 
         self.num_experts = getattr(self.config, "num_experts", 0)
         self.quant_config = quant_config
@@ -595,13 +604,52 @@ class MiniCPMSALAForCausalLM(nn.Module):
     ) -> torch.Tensor:
         if input_embeds is not None:
             input_embeds = input_embeds * self.config.scale_emb
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        model_output = self.model(input_ids, positions, forward_batch, input_embeds)
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = model_output
+        else:
+            hidden_states = model_output
         hidden_states = hidden_states / self.scale_width
         if self.config.tie_word_embeddings:
             lm_head = self.model.embed_tokens
         else:
             lm_head = self.lm_head
-        return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states
+        )
+
+    def get_embed_and_head(self):
+        if self.config.tie_word_embeddings:
+            head = self.model.embed_tokens.weight
+        else:
+            head = self.lm_head.weight
+        return self.model.embed_tokens.weight, head
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        num_layers = self.config.num_hidden_layers
+        if layer_ids is None:
+            # Default capture points expressed directly as capture-loop indices
+            # (the +1 convention below does not apply here), mirroring upstream
+            # llama_eagle3's [2, n // 2, n - 3] default.
+            layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            if not layer_ids:
+                raise ValueError(
+                    "MiniCPM EAGLE3 capture requires at least one layer id."
+                )
+            if any(layer_id < 0 or layer_id >= num_layers for layer_id in layer_ids):
+                raise ValueError(
+                    "MiniCPM EAGLE3 capture layer ids must be in "
+                    f"0..{num_layers - 1}; got {layer_ids}."
+                )
+            # The configured ids name target layers; capture happens at the next
+            # layer input where the previous layer output is available. The +1
+            # keeps every mapped index within 0..num_layers, so no further
+            # bound check is needed.
+            layers_to_capture = [val + 1 for val in layer_ids]
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = layers_to_capture
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
