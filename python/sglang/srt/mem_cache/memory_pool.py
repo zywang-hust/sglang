@@ -34,7 +34,7 @@ import torch
 import triton
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.configs.mamba_utils import BaseLinearStateParams, SimpleGLACacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
@@ -90,7 +90,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+def get_tensor_size_bytes(t: Optional[Union[torch.Tensor, List[torch.Tensor]]]):
+    if t is None:
+        return 0
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
@@ -298,7 +300,9 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
-                if name in ("conv", "intermediate_conv_window"):
+                if v is None:
+                    kwargs[name] = None
+                elif name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
                 else:
                     kwargs[name] = v[layer]
@@ -313,8 +317,22 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
+        intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
+        gla_verify_k: Optional[torch.Tensor] = None
+        gla_verify_v: Optional[torch.Tensor] = None
+
+    # Buffers used only for speculative decoding. They are sized
+    # (spec_state_size + 1) instead of (size + 1) and must not be part of
+    # the per-request state transfer.
+    _SPEC_ONLY_FIELDS = frozenset(
+        {
+            "intermediate_ssm",
+            "intermediate_conv_window",
+            "gla_verify_k",
+            "gla_verify_v",
+        }
+    )
 
     def __init__(
         self,
@@ -381,7 +399,55 @@ class MambaPool:
                 dtype=ssm_dtype,
                 device=device,
             )
-            if speculative_num_draft_tokens is not None:
+            use_gla_verify_recompute = (
+                speculative_num_draft_tokens is not None
+                and isinstance(cache_params, SimpleGLACacheParams)
+                and not conv_state_shape
+            )
+            if use_gla_verify_recompute:
+                if ssm_dtype != torch.float32:
+                    raise ValueError(
+                        "SimpleGLA EAGLE verify recompute requires fp32 temporal "
+                        f"state for token-exact rollback; got {ssm_dtype}."
+                    )
+                gla_verify_k = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        spec_state_size + 1,
+                        speculative_num_draft_tokens,
+                        temporal_state_shape[0],
+                        temporal_state_shape[1],
+                    ),
+                    dtype=ssm_dtype,
+                    device=device,
+                )
+                gla_verify_v = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        spec_state_size + 1,
+                        speculative_num_draft_tokens,
+                        temporal_state_shape[0],
+                        temporal_state_shape[2],
+                    ),
+                    dtype=ssm_dtype,
+                    device=device,
+                )
+                self.mamba_cache = self.SpeculativeState(
+                    conv=conv_state,
+                    temporal=temporal_state,
+                    intermediate_ssm=None,
+                    intermediate_conv_window=[],
+                    gla_verify_k=gla_verify_k,
+                    gla_verify_v=gla_verify_v,
+                )
+                logger.info(
+                    f"Mamba Cache is allocated (SimpleGLA verify recompute). "
+                    f"max_mamba_cache_size: {size}, "
+                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB, "
+                    f"gla_verify_kv size: {(get_tensor_size_bytes(gla_verify_k) + get_tensor_size_bytes(gla_verify_v)) / GB:.2f}GB"
+                )
+            elif speculative_num_draft_tokens is not None:
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
                     temporal_state_shape = (
@@ -497,23 +563,37 @@ class MambaPool:
         )
         current_platform.synchronize()
 
-    def get_contiguous_buf_infos(self):
-        """
-        Get buffer info for RDMA registration.
-        Only returns conv and temporal state buffers, excluding intermediate buffers
-        used for speculative decoding (intermediate_ssm, intermediate_conv_window).
+    def _transferable_state_tensors(self) -> List[torch.Tensor]:
+        """Get the per-request state tensors, excluding spec-only verify buffers.
+
+        Excluding the spec-only fields (intermediate_ssm / intermediate_conv_window
+        and the SimpleGLA gla_verify_k/v) is also a correctness fix for
+        get_state_dim_per_tensor: those buffers carry speculative_num_draft_tokens
+        at dim 2, not the TP-sliceable head/conv dim, so the previous vars()-based
+        scan returned wrong per-tensor TP sizes for any spec-decode model. Both
+        callers now share this filtered view.
         """
         state_tensors = []
-        for field in vars(self.mamba_cache):
-            # Skip intermediate buffers used only for speculative decoding
-            # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
+        # Use fields instead of vars to avoid torch.compile graph break
+        for f in fields(self.mamba_cache):
+            if f.name in self._SPEC_ONLY_FIELDS:
                 continue
-            value = getattr(self.mamba_cache, field)
+            value = getattr(self.mamba_cache, f.name)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
                 state_tensors.append(value)
+        return state_tensors
+
+    def get_contiguous_buf_infos(self):
+        """
+        Get buffer info for RDMA registration.
+        Only returns the per-request state buffers (conv, temporal), excluding
+        spec-only verify buffers.
+        """
+        state_tensors = self._transferable_state_tensors()
         data_ptrs, data_lens, item_lens = [], [], []
 
         for _, state_tensor in enumerate(state_tensors):
@@ -536,13 +616,7 @@ class MambaPool:
         The 3rd dimension (index 2) is the one that gets sliced by TP.
         Returns the size of this dimension for each tensor (repeated for each layer).
         """
-        state_tensors = []
-        for field in vars(self.mamba_cache):
-            value = getattr(self.mamba_cache, field)
-            if isinstance(value, list):
-                state_tensors.extend(value)
-            else:
-                state_tensors.append(value)
+        state_tensors = self._transferable_state_tensors()
 
         dim_per_tensor = []
         for state_tensor in state_tensors:

@@ -1284,11 +1284,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
-        # Update mamba state for hybrid GDN models after verification
+        # Update recurrent state after verification. List each hybrid config
+        # explicitly (not a mambaish_config blanket) so KDA/kimi-style backends
+        # without verify writeback stay out; MiniCPM SimpleGLA commits through
+        # the same update_mamba_state_after_mtp_verify path (its gla_verify_k
+        # branch handles the no-conv recompute).
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
+            or self.target_worker.model_runner.minicpm_hybrid_config is not None
         ):
             self._mamba_verify_update(batch, accept_lens, accept_index, bs)
 
@@ -1344,7 +1349,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         accept_index: torch.Tensor,
         bs: int,
     ):
-        """Update mamba state for hybrid GDN models after verification."""
+        """Update hybrid recurrent state after verification."""
         # `accept_lens` already includes the bonus token (drafts + 1 per req).
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
             accept_indices_offset = torch.arange(

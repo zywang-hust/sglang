@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
 try:
     from fla.ops.simple_gla import chunk_simple_gla
     from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
+    from fla.ops.utils.op import exp as _fla_exp
 
     SIMPLE_GLA_AVAILABLE = True
 except ImportError:
@@ -33,15 +34,593 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cpu, is_cuda
-
-if not is_cpu():
-    pass
-
-if is_cuda():
-    pass
 
 logger = logging.getLogger(__name__)
+
+
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "USE_INITIAL_STATE_INDICES": lambda args: args["h0_indices"] is not None,
+        "STORE_HT": lambda args: args["ht_all"] is not None,
+    }
+)
+@triton.jit
+def _fused_recurrent_gla_verify_tree_paths_kernel(
+    q,
+    k,
+    v,
+    g_gamma,
+    o,
+    h0,
+    h0_indices,
+    ht_all,
+    cu_seqlens,
+    scale,
+    retrieve_parent_token_ptr,
+    q_stride_t,
+    q_stride_h,
+    k_stride_t,
+    k_stride_h,
+    v_stride_t,
+    v_stride_h,
+    o_stride_nk,
+    o_stride_t,
+    o_stride_h,
+    h0_stride_n,
+    h0_stride_h,
+    ht_stride_n,
+    ht_stride_t,
+    ht_stride_h,
+    stride_retrieve_parent_token_seq,
+    stride_retrieve_parent_token_token,
+    T: tl.constexpr,
+    NP2_T: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    USE_INITIAL_STATE_INDICES: tl.constexpr,
+    HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    STORE_HT: tl.constexpr,
+):
+    # One program per (seq, token, head, state tile). Each token's state is
+    # recomputed from the live initial state by replaying its root-to-token
+    # path in registers, so no state ever transits memory between tokens.
+    # The replay applies the same fp32 decay/accumulation order as the fla
+    # reference fused_recurrent_simple_gla, keeping every state and output
+    # bitwise identical to it.
+    i_v = tl.program_id(0).to(tl.int64)
+    i_k = tl.program_id(1).to(tl.int64)
+    i_nth = tl.program_id(2).to(tl.int64)
+    i_h = i_nth % H
+    i_nt = i_nth // H
+    i_t = i_nt % T
+    i_n = i_nt // T
+
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+    # CUDA-graph padding rows carry an empty token range; they replay and
+    # store nothing.
+    valid_token = i_t < eos - bos
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_k = o_k < K
+    m_v = o_v < V
+    m_h = m_k[:, None] & m_v[None, :]
+    b_g_gamma = tl.load(g_gamma + i_h)
+
+    # Walk token -> root (same pattern as the commit kernel), then replay the
+    # collected path in root-first order. Chain mode (topk=1) shares the walk
+    # with an implicit parent of node - 1, so both modes feed the replay loop
+    # the same dataflow and compile to the same floating-point schedule.
+    token_offsets = tl.arange(0, NP2_T)
+    path_nodes = tl.zeros((NP2_T,), dtype=tl.int64)
+    node = i_t
+    done = ~valid_token
+    depth = tl.full((), 0, dtype=tl.int64)
+    for i in tl.static_range(0, T):
+        active = ~done
+        path_nodes = tl.where(
+            token_offsets == i,
+            tl.where(active, node, 0),
+            path_nodes,
+        )
+        depth += active.to(tl.int64)
+        valid_parent_load = active & (node >= 0) & (node < T)
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            parent_node = tl.load(
+                retrieve_parent_token_ptr
+                + i_n * stride_retrieve_parent_token_seq
+                + node * stride_retrieve_parent_token_token,
+                mask=valid_parent_load,
+                other=0,
+            ).to(tl.int64)
+        else:
+            parent_node = tl.maximum(node - 1, 0)
+        done = done | (node == 0) | ~valid_parent_load
+        node = parent_node
+
+    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        h0_n = i_n
+        valid_h0 = True
+        if USE_INITIAL_STATE_INDICES:
+            h0_n = tl.load(h0_indices + i_n).to(tl.int64)
+            valid_h0 = h0_n >= 0
+        p_h0 = (
+            h0
+            + h0_n * h0_stride_n
+            + i_h * h0_stride_h
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
+        b_h += tl.load(p_h0, mask=m_h & valid_h0, other=0).to(tl.float32)
+
+    for step in tl.static_range(0, T):
+        valid_step = step < depth
+        reverse_idx = depth - 1 - step
+        path_node = tl.sum(tl.where(token_offsets == reverse_idx, path_nodes, 0))
+        p_k = k + (bos + path_node) * k_stride_t + i_h * k_stride_h + o_k
+        p_v = v + (bos + path_node) * v_stride_t + i_h * v_stride_h + o_v
+        b_k = tl.load(p_k, mask=m_k & valid_step, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=m_v & valid_step, other=0).to(tl.float32)
+        next_h = b_h * _fla_exp(b_g_gamma) + b_k[:, None] * b_v[None, :]
+        b_h = tl.where(valid_step, next_h, b_h)
+
+    p_q = q + (bos + i_t) * q_stride_t + i_h * q_stride_h + o_k
+    b_q = tl.load(p_q, mask=m_k & valid_token, other=0).to(tl.float32) * scale
+    b_o = b_h * b_q[:, None]
+    b_o = tl.sum(b_o, axis=0)
+    p_o = o + i_k * o_stride_nk + (bos + i_t) * o_stride_t + i_h * o_stride_h + o_v
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_v & valid_token)
+
+    if STORE_HT:
+        p_ht = (
+            ht_all
+            + i_n * ht_stride_n
+            + i_t * ht_stride_t
+            + i_h * ht_stride_h
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=m_h & valid_token)
+
+
+def _fused_recurrent_gla_verify_tree_paths(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_gamma: torch.Tensor,
+    scale: float,
+    initial_state: Optional[torch.Tensor],
+    cu_seqlens: torch.Tensor,
+    retrieve_parent_token: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
+    ht_buf: Optional[torch.Tensor] = None,
+    tokens_per_seq: Optional[int] = None,
+) -> torch.Tensor:
+    """Target-verify GLA forward with per-token tree-path recompute.
+
+    ``ht_buf`` is only needed when an external consumer reads the per-token
+    states afterwards (the ``intermediate_ssm`` scatter-commit fallback); the
+    GLA recompute-commit path passes ``None`` and keeps states in registers.
+
+    ``tokens_per_seq`` defaults to the uniform verify layout. Callers packing
+    variable-length sequences must pass the maximum sequence length so every
+    token gets a program; shorter rows are masked off by ``cu_seqlens``.
+    """
+    _, total_t, num_heads, head_dim = q.shape
+    value_dim = v.shape[-1]
+    num_seqs = len(cu_seqlens) - 1
+
+    block_k = min(triton.next_power_of_2(head_dim), 64)
+    block_v = min(triton.next_power_of_2(value_dim), 64)
+    num_k_blocks = triton.cdiv(head_dim, block_k)
+    num_v_blocks = triton.cdiv(value_dim, block_v)
+    if tokens_per_seq is None:
+        tokens_per_seq = total_t // num_seqs
+
+    o_buf = q.new_empty(num_k_blocks, *v.shape, dtype=torch.float32)
+    if retrieve_parent_token is not None:
+        stride_parent_seq = retrieve_parent_token.stride(0)
+        stride_parent_token = retrieve_parent_token.stride(1)
+    else:
+        stride_parent_seq = 0
+        stride_parent_token = 0
+
+    grid = (num_v_blocks, num_k_blocks, num_seqs * tokens_per_seq * num_heads)
+    _fused_recurrent_gla_verify_tree_paths_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        g_gamma=g_gamma,
+        o=o_buf,
+        h0=initial_state,
+        h0_indices=initial_state_indices,
+        ht_all=ht_buf,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        retrieve_parent_token_ptr=retrieve_parent_token,
+        q_stride_t=q.stride(1),
+        q_stride_h=q.stride(2),
+        k_stride_t=k.stride(1),
+        k_stride_h=k.stride(2),
+        v_stride_t=v.stride(1),
+        v_stride_h=v.stride(2),
+        o_stride_nk=o_buf.stride(0),
+        o_stride_t=o_buf.stride(2),
+        o_stride_h=o_buf.stride(3),
+        h0_stride_n=initial_state.stride(0) if initial_state is not None else 0,
+        h0_stride_h=initial_state.stride(1) if initial_state is not None else 0,
+        ht_stride_n=ht_buf.stride(0) if ht_buf is not None else 0,
+        ht_stride_t=ht_buf.stride(1) if ht_buf is not None else 0,
+        ht_stride_h=ht_buf.stride(2) if ht_buf is not None else 0,
+        stride_retrieve_parent_token_seq=stride_parent_seq,
+        stride_retrieve_parent_token_token=stride_parent_token,
+        T=tokens_per_seq,
+        NP2_T=triton.next_power_of_2(tokens_per_seq),
+        H=num_heads,
+        K=head_dim,
+        V=value_dim,
+        BK=block_k,
+        BV=block_v,
+        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+    )
+    return o_buf.sum(0).to(q.dtype)
+
+
+@triton.jit
+def _recompute_and_scatter_gla_state_from_tree_paths_kernel(
+    k,
+    v,
+    g_gamma,
+    states,
+    retrieve_parent_token,
+    selected_req_indices,
+    initial_state_indices,
+    commit_nodes,
+    commit_dst_indices,
+    track_nodes,
+    track_dst_indices,
+    k_stride_l,
+    k_stride_b,
+    k_stride_t,
+    k_stride_h,
+    v_stride_l,
+    v_stride_b,
+    v_stride_t,
+    v_stride_h,
+    state_stride_l,
+    state_stride_n,
+    state_stride_h,
+    parent_stride_b,
+    parent_stride_t,
+    REQS: tl.constexpr,
+    DST_SIZE: tl.constexpr,
+    DRAFT_TOKEN_NUM: tl.constexpr,
+    NP2_T: tl.constexpr,
+    PATHS: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+):
+    i_v = tl.program_id(0).to(tl.int64)
+    i_k = tl.program_id(1).to(tl.int64)
+    i_layer_path_h = tl.program_id(2).to(tl.int64)
+    i_h = i_layer_path_h % H
+    i_layer_path = i_layer_path_h // H
+    i_path = i_layer_path % PATHS
+    i_layer = i_layer_path // PATHS
+
+    req_idx = tl.load(selected_req_indices + i_path).to(tl.int64)
+    h0_idx = tl.load(initial_state_indices + i_path).to(tl.int64)
+    valid_req = (req_idx >= 0) & (req_idx < REQS)
+    valid_h0 = (h0_idx >= 0) & (h0_idx < DST_SIZE)
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_k = o_k < K
+    m_v = o_v < V
+    m_h = m_k[:, None] & m_v[None, :]
+    token_offsets = tl.arange(0, NP2_T)
+    b_g_gamma = tl.load(g_gamma + i_h)
+
+    # Track buffers are prefix-cache slots. Store them before live commit so the
+    # tracked state is recomputed from the pre-verify live state.
+    for which in tl.static_range(0 if HAS_TRACK else 1, 2):
+        if which == 0:
+            selected_node = tl.load(track_nodes + i_path).to(tl.int64)
+            dst_idx = tl.load(track_dst_indices + i_path).to(tl.int64)
+        else:
+            selected_node = tl.load(commit_nodes + i_path).to(tl.int64)
+            dst_idx = tl.load(commit_dst_indices + i_path).to(tl.int64)
+
+        valid_dst = (dst_idx >= 0) & (dst_idx < DST_SIZE)
+        valid_selected = (selected_node >= 0) & (selected_node < DRAFT_TOKEN_NUM)
+        valid_target = valid_req & valid_h0 & valid_dst & valid_selected
+
+        path_nodes = tl.zeros((NP2_T,), dtype=tl.int64)
+        node = selected_node
+        done = ~valid_target
+        depth = tl.full((), 0, dtype=tl.int64)
+        for i in tl.static_range(0, DRAFT_TOKEN_NUM):
+            active = ~done
+            path_nodes = tl.where(
+                token_offsets == i,
+                tl.where(active, node, 0),
+                path_nodes,
+            )
+            depth += active.to(tl.int64)
+            valid_parent_load = active & (node >= 0) & (node < DRAFT_TOKEN_NUM)
+            parent_node = tl.load(
+                retrieve_parent_token
+                + req_idx * parent_stride_b
+                + node * parent_stride_t,
+                mask=valid_parent_load,
+                other=0,
+            ).to(tl.int64)
+            done = done | (node == 0) | ~valid_parent_load
+            node = parent_node
+
+        p_h0 = (
+            states
+            + i_layer * state_stride_l
+            + h0_idx * state_stride_n
+            + i_h * state_stride_h
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
+        b_h = tl.load(p_h0, mask=m_h & valid_target, other=0).to(tl.float32)
+
+        for step in tl.static_range(0, DRAFT_TOKEN_NUM):
+            valid_step = step < depth
+            reverse_idx = depth - 1 - step
+            path_node = tl.sum(tl.where(token_offsets == reverse_idx, path_nodes, 0))
+            p_k = (
+                k
+                + i_layer * k_stride_l
+                + req_idx * k_stride_b
+                + path_node * k_stride_t
+                + i_h * k_stride_h
+                + o_k
+            )
+            p_v = (
+                v
+                + i_layer * v_stride_l
+                + req_idx * v_stride_b
+                + path_node * v_stride_t
+                + i_h * v_stride_h
+                + o_v
+            )
+            b_k = tl.load(p_k, mask=m_k & valid_step & valid_target, other=0).to(
+                tl.float32
+            )
+            b_v = tl.load(p_v, mask=m_v & valid_step & valid_target, other=0).to(
+                tl.float32
+            )
+            next_h = b_h * _fla_exp(b_g_gamma) + b_k[:, None] * b_v[None, :]
+            b_h = tl.where(valid_step & valid_target, next_h, b_h)
+
+        p_dst = (
+            states
+            + i_layer * state_stride_l
+            + dst_idx * state_stride_n
+            + i_h * state_stride_h
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
+        tl.store(p_dst, b_h.to(p_dst.dtype.element_ty), mask=m_h & valid_target)
+
+
+def _recompute_and_scatter_gla_state_from_tree_paths(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_gamma: torch.Tensor,
+    states: torch.Tensor,
+    retrieve_parent_token: torch.Tensor,
+    selected_req_indices: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    commit_nodes: torch.Tensor,
+    commit_dst_indices: torch.Tensor,
+    track_nodes: Optional[torch.Tensor] = None,
+    track_dst_indices: Optional[torch.Tensor] = None,
+) -> None:
+    layers, num_reqs, draft_token_num, num_heads, head_dim = k.shape
+    value_dim = v.shape[-1]
+    num_paths = selected_req_indices.shape[0]
+
+    if (track_nodes is None) != (track_dst_indices is None):
+        raise ValueError("track_nodes and track_dst_indices must be provided together")
+    has_track = track_nodes is not None
+
+    block_k = min(triton.next_power_of_2(head_dim), 64)
+    block_v = min(triton.next_power_of_2(value_dim), 64)
+    num_k_blocks = triton.cdiv(head_dim, block_k)
+    num_v_blocks = triton.cdiv(value_dim, block_v)
+
+    grid = (num_v_blocks, num_k_blocks, layers * num_paths * num_heads)
+    _recompute_and_scatter_gla_state_from_tree_paths_kernel[grid](
+        k=k,
+        v=v,
+        g_gamma=g_gamma,
+        states=states,
+        retrieve_parent_token=retrieve_parent_token,
+        selected_req_indices=selected_req_indices,
+        initial_state_indices=initial_state_indices,
+        commit_nodes=commit_nodes,
+        commit_dst_indices=commit_dst_indices,
+        track_nodes=track_nodes,
+        track_dst_indices=track_dst_indices,
+        k_stride_l=k.stride(0),
+        k_stride_b=k.stride(1),
+        k_stride_t=k.stride(2),
+        k_stride_h=k.stride(3),
+        v_stride_l=v.stride(0),
+        v_stride_b=v.stride(1),
+        v_stride_t=v.stride(2),
+        v_stride_h=v.stride(3),
+        state_stride_l=states.stride(0),
+        state_stride_n=states.stride(1),
+        state_stride_h=states.stride(2),
+        parent_stride_b=retrieve_parent_token.stride(0),
+        parent_stride_t=retrieve_parent_token.stride(1),
+        REQS=num_reqs,
+        DST_SIZE=states.shape[1],
+        DRAFT_TOKEN_NUM=draft_token_num,
+        NP2_T=triton.next_power_of_2(draft_token_num),
+        PATHS=num_paths,
+        H=num_heads,
+        K=head_dim,
+        V=value_dim,
+        BK=block_k,
+        BV=block_v,
+        HAS_TRACK=has_track,
+    )
+
+
+@triton.jit
+def _build_retrieve_parent_token_kernel(
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    out_ptr,
+    active_bs,
+    stride_next_seq: tl.constexpr,
+    stride_next_token: tl.constexpr,
+    stride_sibling_seq: tl.constexpr,
+    stride_sibling_token: tl.constexpr,
+    stride_out_seq: tl.constexpr,
+    stride_out_token: tl.constexpr,
+    DRAFT_TOKEN_NUM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    token_idx = tl.arange(0, BLOCK)
+    token_mask = token_idx < DRAFT_TOKEN_NUM
+    active = batch_idx < active_bs
+
+    next_token = tl.load(
+        retrieve_next_token_ptr
+        + batch_idx * stride_next_seq
+        + token_idx * stride_next_token,
+        mask=active & token_mask,
+        other=-1,
+    )
+    next_sibling = tl.load(
+        retrieve_next_sibling_ptr
+        + batch_idx * stride_sibling_seq
+        + token_idx * stride_sibling_token,
+        mask=active & token_mask,
+        other=-1,
+    )
+    parent = tl.zeros((BLOCK,), dtype=tl.int32)
+
+    # EAGLE tree nodes are emitted in topological order: a parent appears before
+    # its children, and siblings share the current node's parent.
+    for curr in tl.static_range(0, DRAFT_TOKEN_NUM):
+        child = tl.sum(tl.where(token_idx == curr, next_token, 0))
+        if child != -1:
+            parent = tl.where(token_idx == child, curr, parent)
+
+        sibling = tl.sum(tl.where(token_idx == curr, next_sibling, 0))
+        if sibling != -1:
+            curr_parent = tl.sum(tl.where(token_idx == curr, parent, 0))
+            parent = tl.where(token_idx == sibling, curr_parent, parent)
+
+    tl.store(
+        out_ptr + batch_idx * stride_out_seq + token_idx * stride_out_token,
+        parent,
+        mask=token_mask,
+    )
+
+
+def _build_retrieve_parent_token_ref(
+    retrieve_next_token: Optional[torch.Tensor],
+    retrieve_next_sibling: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Pure-Python reference for ``_build_retrieve_parent_token`` (tests only)."""
+    if retrieve_next_token is None or retrieve_next_sibling is None:
+        return out
+
+    batch_size, draft_token_num = retrieve_next_token.shape
+    next_cpu = retrieve_next_token.cpu().tolist()
+    sibling_cpu = retrieve_next_sibling.cpu().tolist()
+    parent_cpu = [[0] * draft_token_num for _ in range(batch_size)]
+
+    for batch_idx in range(batch_size):
+        queue = [0]
+        seen = {0}
+        for node in queue:
+            child = next_cpu[batch_idx][node]
+            while child != -1:
+                if not 0 <= child < draft_token_num:
+                    raise ValueError(
+                        f"Invalid EAGLE child index {child} for "
+                        f"draft_token_num={draft_token_num}."
+                    )
+                if child not in seen:
+                    parent_cpu[batch_idx][child] = node
+                    queue.append(child)
+                    seen.add(child)
+                sibling = sibling_cpu[batch_idx][child]
+                if sibling != -1 and not 0 <= sibling < draft_token_num:
+                    raise ValueError(
+                        f"Invalid EAGLE sibling index {sibling} for "
+                        f"draft_token_num={draft_token_num}."
+                    )
+                child = sibling
+
+    parent = torch.tensor(
+        parent_cpu,
+        dtype=retrieve_next_token.dtype,
+        device=retrieve_next_token.device,
+    )
+    if out is None:
+        return parent
+
+    out[:batch_size].copy_(parent)
+    if out.shape[0] > batch_size:
+        out[batch_size:].zero_()
+    return out
+
+
+def _build_retrieve_parent_token(
+    retrieve_next_token: Optional[torch.Tensor],
+    retrieve_next_sibling: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    if retrieve_next_token is None or retrieve_next_sibling is None:
+        return out
+
+    assert retrieve_next_token.is_cuda and retrieve_next_sibling.is_cuda
+
+    batch_size, draft_token_num = retrieve_next_token.shape
+    if out is None:
+        out = torch.empty_like(retrieve_next_token)
+
+    block = triton.next_power_of_2(draft_token_num)
+    _build_retrieve_parent_token_kernel[(out.shape[0],)](
+        retrieve_next_token,
+        retrieve_next_sibling,
+        out,
+        batch_size,
+        retrieve_next_token.stride(0),
+        retrieve_next_token.stride(1),
+        retrieve_next_sibling.stride(0),
+        retrieve_next_sibling.stride(1),
+        out.stride(0),
+        out.stride(1),
+        DRAFT_TOKEN_NUM=draft_token_num,
+        BLOCK=block,
+    )
+    return out
 
 
 def _build_slope_tensor(nheads: int) -> torch.Tensor:
@@ -180,6 +759,12 @@ def track_mamba_states_if_needed(
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # Conv backends (Mamba2/GDN) get retrieve_parent_token computed as a fused
+    # side output of causal_conv1d_update, so metadata only needs a scratch
+    # buffer. Backends without a conv1d (SimpleGLA) override this to True and
+    # build the parent-token map during metadata prep instead.
+    builds_retrieve_parent_in_metadata: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -260,8 +845,18 @@ class MambaAttnBackendBase(AttentionBackend):
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
                     )
-                    # retrieve_next_token is None during dummy run so skip tensor creation
-                    if retrieve_next_token is not None:
+                    # retrieve_next_token is None during dummy run, where the
+                    # builder returns None and skips tensor creation.
+                    if self.builds_retrieve_parent_in_metadata:
+                        # SimpleGLA has no conv1d to fuse the parent-token map,
+                        # so build it explicitly here.
+                        retrieve_parent_token = _build_retrieve_parent_token(
+                            retrieve_next_token, retrieve_next_sibling
+                        )
+                    elif retrieve_next_token is not None:
+                        # Conv backends get retrieve_parent_token fused inside
+                        # causal_conv1d_update; this is the scratch buffer the
+                        # conv kernel writes into.
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
@@ -314,13 +909,16 @@ class MambaAttnBackendBase(AttentionBackend):
         in_capture: bool = False,
     ):
         # seq_lens_cpu is unused by _replay_metadata for the non-target-verify
-        # case but kept in the contract for compatibility.
+        # case but kept in the contract for compatibility. forward_batch is
+        # forwarded so _replay_metadata can read the replay-view side channel
+        # (_source_forward_batch) for the exact padding count.
         self.forward_metadata = self._replay_metadata(
             forward_batch.batch_size,
             forward_batch.req_pool_indices,
             forward_batch.forward_mode,
             forward_batch.spec_info,
             forward_batch.seq_lens_cpu if not in_capture else None,
+            forward_batch,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -574,12 +1172,28 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
     ):
-        if seq_lens_cpu is None:
+        # CUDA-graph replay pads the batch up to a captured size; padding reqs
+        # occupy the tail [raw_bs:bs]. Derive the count from the live (un-padded)
+        # request count off the replay-view side channel rather than from seq_len
+        # values: the mamba fill value (1) collides with a genuine 1-token verify
+        # prefix. ``_source_forward_batch`` is set by build_replay_fb_view; absent
+        # it (e.g. capture, where seq_lens_cpu is None) the count is 0.
+        source_fb = (
+            getattr(forward_batch, "_source_forward_batch", None)
+            if forward_batch is not None
+            else None
+        )
+        if source_fb is not None:
+            num_padding = bs - source_fb.batch_size
+        elif seq_lens_cpu is None:
             num_padding = 0
         else:
-            num_padding = torch.count_nonzero(
-                seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+            num_padding = int(
+                torch.count_nonzero(
+                    seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                )
             )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
@@ -626,6 +1240,15 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
                     spec_info.retrieve_next_sibling
                 )
+                # Conv backends get retrieve_parent_token fused inside
+                # causal_conv1d_update; SimpleGLA has no conv1d, so build the
+                # parent-token map into the captured buffer here.
+                if self.builds_retrieve_parent_in_metadata:
+                    _build_retrieve_parent_token(
+                        spec_info.retrieve_next_token,
+                        spec_info.retrieve_next_sibling,
+                        out=self.retrieve_parent_token_list[bs - 1],
+                    )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -738,6 +1361,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch.forward_mode,
             forward_batch.spec_info,
             forward_batch.seq_lens_cpu if not in_capture else None,
+            forward_batch,
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
@@ -1043,10 +1667,24 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv[0]
+        if mamba_caches.gla_verify_k is not None:
+            self._update_simple_gla_state_after_mtp_verify_with_recompute(
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                state_indices_tensor=state_indices_tensor,
+                mamba_caches=mamba_caches,
+                request_number=request_number,
+            )
+            return
+
+        has_conv = len(mamba_caches.conv) > 0
+        conv_states = mamba_caches.conv[0] if has_conv else None
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+        intermediate_conv_window_cache = (
+            mamba_caches.intermediate_conv_window[0] if has_conv else None
+        )
 
         # Use fully fused kernel that handles masking internally
         # This avoids separate nonzero() and index_select() calls
@@ -1056,12 +1694,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             state_indices_tensor,
             last_correct_step_indices,
         )
-        fused_mamba_state_scatter_with_mask(
-            conv_states,
-            intermediate_conv_window_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+        if has_conv:
+            fused_mamba_state_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
 
         # Track indices used for tracking mamba states for prefix cache
         if mamba_track_indices is not None:
@@ -1073,12 +1712,76 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
-            fused_mamba_state_scatter_with_mask(
-                conv_states,
-                intermediate_conv_window_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
+            if has_conv:
+                fused_mamba_state_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+
+    def _update_simple_gla_state_after_mtp_verify_with_recompute(
+        self,
+        *,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+        state_indices_tensor: torch.Tensor,
+        mamba_caches,
+        request_number: int,
+    ) -> None:
+        ssm_states = mamba_caches.temporal
+        saved_k = mamba_caches.gla_verify_k
+        saved_v = mamba_caches.gla_verify_v
+        assert saved_k is not None
+        assert saved_v is not None
+
+        device = last_correct_step_indices.device
+        state_indices = state_indices_tensor.to(torch.int64)
+        selected_req_indices = torch.arange(
+            request_number, dtype=torch.int64, device=device
+        )
+        commit_steps = last_correct_step_indices.to(torch.int64).contiguous()
+        retrieve_parent_token = (
+            self.linear_attn_backend.forward_metadata.retrieve_parent_token
+        )
+        if retrieve_parent_token is None:
+            draft_token_num = saved_k.shape[2]
+            retrieve_parent_token = torch.empty(
+                (request_number, draft_token_num), dtype=torch.int64, device=device
             )
+            retrieve_parent_token[:, 0] = 0
+            if draft_token_num > 1:
+                retrieve_parent_token[:, 1:] = torch.arange(
+                    0, draft_token_num - 1, dtype=torch.int64, device=device
+                )
+        else:
+            retrieve_parent_token = retrieve_parent_token[:request_number]
+
+        has_track = mamba_track_indices is not None
+        if has_track:
+            assert mamba_steps_to_track is not None
+            track_indices = mamba_track_indices[:request_number].to(torch.int64)
+            track_steps = (
+                mamba_steps_to_track[:request_number].to(torch.int64).contiguous()
+            )
+        else:
+            track_indices = None
+            track_steps = None
+
+        _recompute_and_scatter_gla_state_from_tree_paths(
+            k=saved_k,
+            v=saved_v,
+            g_gamma=self.linear_attn_backend.g_gamma,
+            states=ssm_states,
+            retrieve_parent_token=retrieve_parent_token,
+            selected_req_indices=selected_req_indices,
+            initial_state_indices=state_indices,
+            commit_nodes=commit_steps,
+            commit_dst_indices=state_indices,
+            track_nodes=track_steps,
+            track_dst_indices=track_indices,
+        )
 
 
 class SimpleGLAAttnBackend(MambaAttnBackendBase):
@@ -1093,6 +1796,9 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
     construction, allowing the caller to fall back to an alternative backend such
     as ``Mamba2AttnBackend``.
     """
+
+    # No conv1d to fuse the parent-token map into, so build it in metadata prep.
+    builds_retrieve_parent_in_metadata: bool = True
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -1160,6 +1866,23 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 forward_batch.req_pool_indices
             )
 
+    def _mamba_layer_cache(self, layer_id: int):
+        """Resolve the mamba cache slot and per-layer cache for ``layer_id``.
+
+        Raises:
+            RuntimeError: If the layer is not registered in mamba_map.
+        """
+        cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+        if cache_idx is None:
+            raise RuntimeError(
+                f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
+                f"This indicates a misconfiguration - linear-attention layers must be "
+                f"registered in the pool's mamba_map. "
+                f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
+            )
+        layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
+        return cache_idx, layer_cache
+
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -1174,8 +1897,8 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         self.forward_metadata = metadata
 
     # CUDA graph capture/replay is inherited from
-    # MambaAttnBackendBase.init_forward_metadata_out_graph, which dispatches to
-    # this class's _replay_metadata override for both capture and replay.
+    # MambaAttnBackendBase.init_forward_metadata_out_graph, which routes both
+    # capture and replay through the inherited _replay_metadata.
 
     def forward(
         self,
@@ -1189,74 +1912,106 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         num_heads = q.shape[2]
         head_dim = q.shape[3]
-        if forward_batch.forward_mode.is_decode():
-            seq_len = 1
-        else:
-            seq_len = torch.max(forward_batch.extend_seq_lens)
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
 
         mamba_indices = self._get_mamba_indices(forward_batch)
         initial_state = None
-        has_initial_state = (
-            forward_batch.extend_prefix_lens is not None
-            and forward_batch.extend_prefix_lens > 0
-        )
-        if forward_batch.forward_mode.is_decode() or has_initial_state.any():
-            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
-            if cache_idx is not None:
-                layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(
-                    cache_idx
-                )
-                initial_state = layer_cache.temporal[mamba_indices, :].contiguous()
+        initial_state_indices = None
+        layer_cache = None
+        if (
+            forward_batch.forward_mode.is_decode()
+            or is_target_verify
+            or (
+                forward_batch.extend_prefix_lens is not None
+                and (forward_batch.extend_prefix_lens > 0).any()
+            )
+        ):
+            cache_idx, layer_cache = self._mamba_layer_cache(layer_id)
+            if is_target_verify:
+                initial_state = layer_cache.temporal
+                initial_state_indices = mamba_indices
             else:
-                raise RuntimeError(
-                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
-                    f"This indicates a misconfiguration - lightning layers must be registered in cache_params.layers. "
-                    f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
-                )
+                initial_state = layer_cache.temporal[mamba_indices, :].contiguous()
 
         scale = self.scale
 
         g_gamma = self.g_gamma
 
-        mode = "fused_recurrent" if seq_len < 64 else "chunk"
-        if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
-            o, final_state = fused_recurrent_simple_gla(
+        if is_target_verify:
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            batch_size = forward_batch.batch_size
+            total_tokens = batch_size * draft_token_num
+            spec_cache = (
+                self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            )
+            # SimpleGLA always allocates gla_verify_k under speculative decode,
+            # so the commit kernel replays the accepted path from the saved k/v
+            # and no per-token state is materialized here.
+            ht_buf = None
+            # gla_verify_k/v are fp32; k/v are bf16 model tensors. The implicit
+            # bf16->fp32 upcast here is lossless and required so the recompute
+            # kernel runs at the same precision as the fp32 forward accumulator
+            # (token-exact rollback).
+            spec_cache.gla_verify_k[cache_idx, :batch_size, :draft_token_num].copy_(
+                k.reshape(batch_size, draft_token_num, num_heads, head_dim)
+            )
+            spec_cache.gla_verify_v[cache_idx, :batch_size, :draft_token_num].copy_(
+                v.reshape(batch_size, draft_token_num, num_heads, v.shape[-1])
+            )
+            cu_seqlens = torch.arange(
+                0,
+                total_tokens + 1,
+                step=draft_token_num,
+                dtype=torch.int64,
+                device=q.device,
+            )
+            o = _fused_recurrent_gla_verify_tree_paths(
                 q=q,
                 k=k,
                 v=v,
                 g_gamma=g_gamma,
                 scale=scale,
                 initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=self.forward_metadata.query_start_loc,
+                initial_state_indices=initial_state_indices,
+                cu_seqlens=cu_seqlens,
+                retrieve_parent_token=self.forward_metadata.retrieve_parent_token,
+                ht_buf=ht_buf,
             )
+            final_state = None
         else:
-            o, final_state = chunk_simple_gla(
-                q=q,
-                k=k,
-                v=v,
-                g_gamma=g_gamma,
-                initial_state=initial_state,
-                output_final_state=True,
-                scale=scale,
-                cu_seqlens=self.forward_metadata.query_start_loc,
+            seq_len = (
+                1
+                if forward_batch.forward_mode.is_decode()
+                else torch.max(forward_batch.extend_seq_lens)
             )
+            mode = "fused_recurrent" if seq_len < 64 else "chunk"
+            if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+                o, final_state = fused_recurrent_simple_gla(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g_gamma=g_gamma,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=self.forward_metadata.query_start_loc,
+                )
+            else:
+                o, final_state = chunk_simple_gla(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g_gamma=g_gamma,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    scale=scale,
+                    cu_seqlens=self.forward_metadata.query_start_loc,
+                )
 
         if final_state is not None:
-            mamba_indices = self._get_mamba_indices(forward_batch)
-            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
-
-            if cache_idx is not None:
-                layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(
-                    cache_idx
-                )
-                layer_cache.temporal[mamba_indices, :] = final_state
-            else:
-                raise RuntimeError(
-                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
-                    f"Cannot save state - layer must be registered in cache_params.layers. "
-                    f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
-                )
+            if layer_cache is None:
+                _, layer_cache = self._mamba_layer_cache(layer_id)
+            layer_cache.temporal[mamba_indices, :] = final_state
 
         o = o.reshape(-1, num_heads * head_dim)
 

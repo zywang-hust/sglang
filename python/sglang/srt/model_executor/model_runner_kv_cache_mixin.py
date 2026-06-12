@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.configs.mamba_utils import SimpleGLACacheParams
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     is_deepseek_dsa,
@@ -63,6 +64,35 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _simple_gla_intermediate_bytes_per_token(cache_params: SimpleGLACacheParams) -> int:
+    """Per-req, per-draft-token bytes of the SimpleGLA gla_verify_k/v cache.
+
+    SimpleGLA recomputes verify state from saved k/v slabs (H*K and H*V per
+    token) instead of caching a full SSM-state copy, so it is ~head_dim/2x
+    smaller than mamba_cache_per_req.
+    """
+    shape = cache_params.shape.temporal
+    return (
+        len(cache_params.layers)
+        * shape[0]
+        * (shape[1] + shape[2])
+        * cache_params.dtype.temporal.itemsize
+    )
+
+
+def _simple_gla_verify_recompute_reservation_bytes(
+    cache_params: SimpleGLACacheParams,
+    max_running_requests: int,
+    draft_token_num: int,
+) -> int:
+    """Total bytes the gla_verify_k/v cache occupies for ``max_running_requests``
+    requests (the buffer is sized ``max_running_requests + 1`` slots)."""
+    rows = max_running_requests + 1
+    return (
+        _simple_gla_intermediate_bytes_per_token(cache_params) * rows * draft_token_num
+    )
+
+
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         post_model_load_memory = get_available_gpu_memory(
@@ -90,6 +120,28 @@ class ModelRunnerKVCacheMixin:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
+            # Per-req, per-draft-token bytes of the speculative intermediate
+            # cache. Conv backends (Mamba2/GDN) cache a full SSM-state copy per
+            # draft token, i.e. mamba_cache_per_req. SimpleGLA has no conv1d and
+            # instead recomputes verify state from a compact gla_verify_k/v cache
+            # (H*(K+V) per token vs the full H*K*V state, ~head_dim/2x smaller),
+            # so reserving it at the full-state rate would over-commit and starve
+            # the KV pool.
+            cache_params = config.mamba2_cache_params
+            if isinstance(cache_params, SimpleGLACacheParams):
+                intermediate_bytes_per_token = _simple_gla_intermediate_bytes_per_token(
+                    cache_params
+                )
+            else:
+                intermediate_bytes_per_token = cache_params.mamba_cache_per_req
+
+            def spec_intermediate_bytes(max_reqs: int, draft_tokens: int) -> int:
+                if isinstance(cache_params, SimpleGLACacheParams):
+                    return _simple_gla_verify_recompute_reservation_bytes(
+                        cache_params, max_reqs, draft_tokens
+                    )
+                return intermediate_bytes_per_token * max_reqs * draft_tokens
+
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
@@ -103,10 +155,9 @@ class ModelRunnerKVCacheMixin:
                     // (self.dp_size if server_args.enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
-                    * server_args.speculative_num_draft_tokens
+                intermediate_size = spec_intermediate_bytes(
+                    capped_reqs,
+                    server_args.speculative_num_draft_tokens,
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -119,10 +170,9 @@ class ModelRunnerKVCacheMixin:
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
+                intermediate_size = spec_intermediate_bytes(
+                    server_args.max_mamba_cache_size,
+                    server_args.speculative_num_draft_tokens,
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -133,8 +183,10 @@ class ModelRunnerKVCacheMixin:
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
             # The mamba budget (from the ratio split) must cover both:
             #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
+            #   2. intermediate states:
+            #      (max_mamba_cache_size / ratio) * D * intermediate_bytes_per_token
+            # So: max_mamba_cache_size * (per_req + intermediate_bytes_per_token * D/ratio)
+            #     = mamba_budget_bytes
             mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
@@ -145,9 +197,15 @@ class ModelRunnerKVCacheMixin:
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
+                extra_intermediate = (
+                    intermediate_bytes_per_token * D
+                    if isinstance(cache_params, SimpleGLACacheParams)
+                    else 0
+                )
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
+                    (mamba_budget_bytes - extra_intermediate)
+                    // (per_req + intermediate_bytes_per_token * D / ratio)
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
@@ -156,7 +214,10 @@ class ModelRunnerKVCacheMixin:
                     // (self.dp_size if server_args.enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * capped_reqs * D
+                intermediate_size = spec_intermediate_bytes(
+                    capped_reqs,
+                    D,
+                )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)

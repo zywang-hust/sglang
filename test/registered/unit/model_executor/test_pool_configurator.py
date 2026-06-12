@@ -10,7 +10,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
+from sglang.srt.configs.mamba_utils import (
+    Mamba2StateDType,
+    SimpleGLACacheParams,
+    SimpleGLAStateShape,
+)
+from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    ModelRunnerKVCacheMixin,
+    _simple_gla_verify_recompute_reservation_bytes,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -163,6 +176,130 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+
+class TestSimpleGLAVerifyRecomputeReservation(CustomTestCase):
+    """MiniCPM SimpleGLA verify recompute reserves its real verify buffers."""
+
+    @staticmethod
+    def _cache_params(num_layers=8):
+        shape = SimpleGLAStateShape.create(
+            tp_world_size=1,
+            num_heads=2,
+            head_dim=16,
+            state_size=16,
+        )
+        return SimpleGLACacheParams(shape=shape, layers=list(range(num_layers)))
+
+    @staticmethod
+    def _runner(cache_params, *, max_mamba_cache_size=10, mamba_ratio=3):
+        server_args = SimpleNamespace(
+            speculative_num_draft_tokens=5,
+            max_running_requests=16,
+            enable_dp_attention=False,
+            max_mamba_cache_size=max_mamba_cache_size,
+            disable_radix_cache=False,
+            mamba_full_memory_ratio=0.9,
+        )
+        spec_algorithm = MagicMock()
+        spec_algorithm.is_none.return_value = False
+        return SimpleNamespace(
+            mambaish_config=SimpleNamespace(mamba2_cache_params=cache_params),
+            server_args=server_args,
+            spec_algorithm=spec_algorithm,
+            dp_size=1,
+            _calculate_mamba_ratio=lambda: mamba_ratio,
+        )
+
+    def test_recompute_reserves_scratch_and_kv_instead_of_full_snapshots(self):
+        cache_params = self._cache_params()
+        draft_token_num = 5
+        max_running_requests = 16
+
+        # The compact gla_verify_k/v reservation is strictly smaller than caching
+        # a full SSM-state snapshot per draft token.
+        snapshot_verify_bytes = (
+            cache_params.mamba_cache_per_req * max_running_requests * draft_token_num
+        )
+        recompute_verify_bytes = _simple_gla_verify_recompute_reservation_bytes(
+            cache_params,
+            max_running_requests,
+            draft_token_num,
+        )
+        self.assertLess(recompute_verify_bytes, snapshot_verify_bytes)
+
+        # handle_max_mamba_cache (explicit max_mamba_cache_size branch) reserves
+        # the SimpleGLA intermediate at the compact per-token rate, not the full
+        # SSM-state rate.
+        total_rest_memory_gb = 4.0
+        max_mamba_cache_size = 10
+        mamba_ratio = 3
+        runner = self._runner(
+            cache_params,
+            max_mamba_cache_size=max_mamba_cache_size,
+            mamba_ratio=mamba_ratio,
+        )
+        remaining_gb = ModelRunnerKVCacheMixin.handle_max_mamba_cache(
+            runner, total_rest_memory_gb
+        )
+
+        gib = 1 << 30
+        capped_reqs = min(max_running_requests, max_mamba_cache_size // mamba_ratio)
+        intermediate_gb = (
+            _simple_gla_verify_recompute_reservation_bytes(
+                cache_params, capped_reqs, draft_token_num
+            )
+            / gib
+        )
+        main_state_gb = cache_params.mamba_cache_per_req * max_mamba_cache_size / gib
+        self.assertAlmostEqual(
+            remaining_gb, total_rest_memory_gb - intermediate_gb - main_state_gb
+        )
+
+        # Reserving at the full-state rate for the same requests would have taken
+        # ~head_dim/2x more, leaving strictly less memory for the KV pool.
+        full_rate_intermediate_gb = (
+            cache_params.mamba_cache_per_req * capped_reqs * draft_token_num / gib
+        )
+        self.assertGreater(
+            remaining_gb,
+            total_rest_memory_gb - full_rate_intermediate_gb - main_state_gb,
+        )
+
+    def test_recompute_planner_reservation_tracks_temporal_dtype(self):
+        fp32_params = self._cache_params()
+        bf16_params = SimpleGLACacheParams(
+            shape=fp32_params.shape,
+            layers=fp32_params.layers,
+            dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.bfloat16),
+        )
+
+        fp32_bytes = _simple_gla_verify_recompute_reservation_bytes(
+            fp32_params, max_running_requests=4, draft_token_num=3
+        )
+        bf16_bytes = _simple_gla_verify_recompute_reservation_bytes(
+            bf16_params, max_running_requests=4, draft_token_num=3
+        )
+
+        self.assertEqual(fp32_bytes, bf16_bytes * 2)
+
+    def test_recompute_pool_requires_fp32_temporal_state(self):
+        fp32_params = self._cache_params()
+        bf16_params = SimpleGLACacheParams(
+            shape=fp32_params.shape,
+            layers=fp32_params.layers,
+            dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.bfloat16),
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires fp32 temporal"):
+            MambaPool(
+                size=2,
+                spec_state_size=2,
+                cache_params=bf16_params,
+                mamba_layer_ids=[0],
+                device="cpu",
+                speculative_num_draft_tokens=3,
+            )
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):
