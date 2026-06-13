@@ -1686,9 +1686,11 @@ class MiniCPMSparseBackend(AttentionBackend):
             flashinfer_kv_indices = metadata.flashinfer_kv_indices
             flashinfer_kv_last_page_len = metadata.flashinfer_kv_last_page_len
 
-        # Prepare attention parameters
+        # Use q_reshaped: q arrives non-contiguous when attn_use_rope is False
+        # (split view of fused QKV), so q.contiguous() copies and the dense
+        # head-group-major de-interleave above would be silently lost.
         attn_params = AttentionParams(
-            q=q.contiguous().view(-1, layer.tp_q_head_num // 2, layer.head_dim),
+            q=q_reshaped,
             k_cache=key_cache,
             v_cache=value_cache,
             page_table=sparse_page_table_for_attention,
