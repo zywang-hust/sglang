@@ -47,12 +47,13 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
     SparseConfig,
     SparseMetadataBuilder,
     allocate_and_compress_keys,
+    build_verify_plan_counts,
     compressed_attention,
     compressed_attention_tilelang,
     effective_seq_lens_cpu,
+    fill_compress_level_metadata,
     get_compress_k_v2,
     get_compress_k_v2_padded,
-    sparse_block_quantized_count,
 )
 
 
@@ -679,10 +680,6 @@ class MiniCPMSparseBackend(AttentionBackend):
             # for extend); the CUDA-graph path aliases the same tensor.
             metadata.seqlen_k_sparse_bs_tensor = metadata.cache_seqlens_int32
 
-            cu_seqlens_q_sparse_bs = torch.tensor(
-                [0] + seqlen_q_sparse_bs, dtype=torch.int32, device=cu_seqlens_q.device
-            ).cumsum(dtype=torch.int32, dim=0)
-
             extend_prefix_lens_sparse = torch.tensor(
                 [
                     forward_batch.extend_prefix_lens_cpu[bs]
@@ -694,7 +691,6 @@ class MiniCPMSparseBackend(AttentionBackend):
 
             metadata.token_to_bs, metadata.token_pos_in_bs = (
                 self.sparse_metadata_builder.build_token_mappings(
-                    cu_seqlens_q_sparse_bs,
                     extend_prefix_lens_sparse,
                     seqlen_q_sparse_bs,
                     metadata.sparse_bs_list,
@@ -2419,54 +2415,19 @@ class MiniCPMSparseBackend(AttentionBackend):
         token_pos = token_pos + graph["verify_token_offsets"][:token_num]
         metadata.token_pos_in_bs[:token_num].copy_(token_pos)
 
-        # Same integer formulas as the eager SparseMetadataBuilder, evaluated
-        # on device: doing this on CPU costs ~16 pageable H2D copies plus host
-        # cumsums every verify replay, which stalls the scheduler loop.
-        prefix_dev = seq_lens_i32
-        full_dev = prefix_dev + draft_token_num
-
+        # Same integer formulas as the eager SparseMetadataBuilder, evaluated on
+        # device. Doing it on CPU costs ~16 pageable H2D copies plus host cumsums
+        # every verify replay; doing it as eager device ops costs ~27 kernel
+        # launches per level (tiny bs-element math) that stall the host-bound
+        # prepare window. The fused kernel collapses each level to one launch.
         def copy_compress_metadata(
             level: CompressionLevelMetadata,
             req_to_sparse_token: torch.Tensor,
             kernel_size: int,
             kernel_stride: int,
         ):
-            seq_lens_k = ((full_dev - kernel_size) // kernel_stride + 1).clamp(min=0)
-            history_compress = ((prefix_dev - kernel_size) // kernel_stride + 1).clamp(
-                min=0
-            )
-            new_token_nums = full_dev - history_compress * kernel_stride
-            new_compress = ((new_token_nums - kernel_size) // kernel_stride + 1).clamp(
-                min=0
-            )
-            total_compress = history_compress + new_compress
-
-            # The cu_* buffers are zero-initialized and index 0 is never
-            # written non-zero, so only [1 : bs + 1] needs refreshing.
-            torch.cumsum(
-                seq_lens_k, dim=0, dtype=torch.int32, out=level.cu_seqlens[1 : bs + 1]
-            )
-            level.history_compress_token_nums[:bs].copy_(history_compress)
-            level.new_token_nums[:bs].copy_(new_token_nums)
-            level.new_compress_token_nums[:bs].copy_(new_compress)
-            level.total_compress_token_nums[:bs].copy_(total_compress)
-            torch.cumsum(
-                new_token_nums,
-                dim=0,
-                dtype=torch.int32,
-                out=level.cu_new_token_nums[1 : bs + 1],
-            )
-            torch.cumsum(
-                new_compress,
-                dim=0,
-                dtype=torch.int32,
-                out=level.cu_new_compress_token_nums[1 : bs + 1],
-            )
-            torch.cumsum(
-                total_compress,
-                dim=0,
-                dtype=torch.int32,
-                out=level.cu_total_compress_token_nums[1 : bs + 1],
+            fill_compress_level_metadata(
+                level, seq_lens_i32, draft_token_num, kernel_size, kernel_stride, bs
             )
             level.table[:bs].copy_(req_to_sparse_token[req_pool_indices])
 
@@ -2525,28 +2486,20 @@ class MiniCPMSparseBackend(AttentionBackend):
             # boundaries (a chain has popcount == off, a tree popcount < off).
             # Derived empirically against the compaction kernel; re-derive if the
             # compaction or the draft layout changes.
-            block_size = self.block_size
-            sparse_topk = self.sparse_topk
-            num_visible_drafts = (
-                metadata.sparse_tree_draft_mask[: token_num * draft_token_num]
-                .view(token_num, draft_token_num)
-                .sum(dim=1)
-                .to(torch.int64)
-            )
-            seq_per_token = torch.repeat_interleave(
-                seq_lens.to(torch.int64), draft_token_num
-            )
-            # Reuse the same per-token offsets the in-graph token_pos_in_bs is built
-            # from, so the planned token_pos matches the compaction's exactly.
-            draft_offsets = graph["verify_token_offsets"][:token_num].to(torch.int64)
-            token_pos = seq_per_token + draft_offsets
-            num_kv_per_token = (
-                sparse_block_quantized_count(token_pos, block_size, sparse_topk)
-                - draft_offsets
-                + num_visible_drafts
-            )
-            num_kv_per_row = num_kv_per_token.repeat_interleave(self.head_group_num).to(
-                torch.int32
+            # Fused into one launch: the mask row-sum (popcount), the per-token
+            # token_pos, the inlined sparse_block_quantized_count, and the
+            # head-group broadcast. Reuses graph["verify_token_offsets"] (the same
+            # per-token offsets the in-graph token_pos_in_bs is built from) so the
+            # planned token_pos matches the compaction's exactly.
+            num_kv_per_row = build_verify_plan_counts(
+                seq_lens_i32,
+                graph["verify_token_offsets"],
+                metadata.sparse_tree_draft_mask,
+                draft_token_num,
+                self.block_size,
+                self.sparse_topk,
+                self.head_group_num,
+                token_num,
             )
 
             # Plan from host-side tensors. A device indptr makes FlashInfer's

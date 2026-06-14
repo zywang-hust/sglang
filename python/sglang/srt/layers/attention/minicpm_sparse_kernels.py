@@ -584,27 +584,9 @@ def compact_sparse_tree_page_table(
     return out_page_table, out_cache_seqlens
 
 
-# Two-kernel sparse page_table -> FlashInfer conversion:
-# Kernel 1: prefix sum over the per-row valid counts
-# Kernel 2: flatten and fill the kv indices
-
-
-@triton.jit
-def cumsum_kernel(
-    cache_seqlens_ptr,
-    kv_indptr_ptr,
-    sparse_bs: tl.constexpr,
-):
-    """Compute cumulative sum using parallel scan algorithm."""
-    # Simple sequential implementation for now
-    # TODO: Implement parallel scan for better performance
-    cumsum = 0
-    tl.store(kv_indptr_ptr, 0)
-
-    for i in range(sparse_bs):
-        val = tl.load(cache_seqlens_ptr + i)
-        cumsum += val
-        tl.store(kv_indptr_ptr + i + 1, cumsum)
+# Sparse page_table -> FlashInfer CSR conversion: torch.cumsum builds the row
+# offsets (kv_indptr) as a parallel scan, then flatten_and_fill_kernel scatters
+# each row's valid kv indices into the CSR layout.
 
 
 @triton.jit
@@ -666,14 +648,17 @@ def convert_sparse_page_table_to_flashinfer(
     sparse_bs = cache_seqlens.shape[0]
     max_sparse_tokens = sparse_page_table.shape[1]
 
-    # Kernel 1: Compute cumulative sum
-    cumsum_kernel[(1,)](
-        cache_seqlens,
-        kv_indptr,
-        sparse_bs=sparse_bs,
-    )
+    # Row offsets = exclusive prefix sum of the per-row valid counts. torch.cumsum
+    # is a parallel scan; the old cumsum_kernel walked all sparse_bs rows on a
+    # single thread-block (sparse_bs = query_tokens * head_group = 16384 for an 8K
+    # chunk, ~1ms/call). Integer prefix sum is bit-identical. The leading 0 is
+    # zeroed on-device via zero_(): under CUDA-graph capture kv_indptr is a
+    # persistent buffer, and a scalar ``kv_indptr[0] = 0`` would be an illegal
+    # unpinned CPU->CUDA copy.
+    kv_indptr[:1].zero_()
+    kv_indptr[1:] = torch.cumsum(cache_seqlens, dim=0, dtype=kv_indptr.dtype)
 
-    # Kernel 2: Flatten and fill
+    # Flatten and fill
     BLOCK_SIZE = 256
     flatten_and_fill_kernel[(sparse_bs,)](
         sparse_page_table,

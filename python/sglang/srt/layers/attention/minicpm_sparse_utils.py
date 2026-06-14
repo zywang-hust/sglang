@@ -26,6 +26,7 @@ import math
 import tilelang
 import tilelang.math
 import triton
+import triton.language as tl
 from sgl_kernel import infllmv2_attn_stage1, max_pooling_1d_varlen
 
 from sglang.srt.layers.attention.minicpm_fuse_kernel import _bucket_size
@@ -70,6 +71,178 @@ def sparse_block_quantized_count(
         (sparse_topk - 1) * block_size + mod,
     )
     return torch.where(positions <= budget, positions, capped)
+
+
+@triton.jit
+def _compress_level_metadata_kernel(
+    prefix_ptr,  # int32 [bs]   prefix (history) seq lens
+    history_ptr,  # int32 [bs]   out: history_compress_token_nums
+    new_token_ptr,  # int32 [bs]   out: new_token_nums (stored unclamped)
+    new_compress_ptr,  # int32 [bs]   out: new_compress_token_nums
+    total_ptr,  # int32 [bs]   out: total_compress_token_nums
+    cu_seqlens_ptr,  # int32 [bs+1] out: cumsum(seq_lens_k) into [1:bs+1]
+    cu_new_token_ptr,  # int32 [bs+1] out: cumsum(new_token_nums) into [1:bs+1]
+    cu_new_compress_ptr,  # int32 [bs+1] out: cumsum(new_compress) into [1:bs+1]
+    cu_total_ptr,  # int32 [bs+1] out: cumsum(total_compress) into [1:bs+1]
+    dtn,  # int   draft_token_num
+    ksize,  # int   compressor kernel_size
+    kstride,  # int   compressor kernel_stride
+    bs,  # int   (padded) batch size
+    BLOCK: tl.constexpr,
+):
+    """One launch builds a whole compression level's verify-replay metadata.
+
+    Replaces ~27 eager ops per level (the integer ``(x - ksize)//kstride + 1``
+    chains, four ``torch.cumsum`` calls, four device copies) that each cost a
+    kernel launch + Python dispatch on tiny ``bs``-element vectors in the
+    host-bound verify-prepare window. The arithmetic is the device mirror of
+    ``_compute_single_compression_metadata``; ``cu_*[0]`` stays the pre-zeroed 0.
+
+    Bit-exact note: ``((x - ksize)//kstride + 1).clamp(min=0)`` is positive only
+    when ``x >= ksize`` (there the numerator is non-negative, so trunc == floor),
+    and is exactly 0 otherwise, so ``where(t >= 0, t // kstride + 1, 0)`` matches
+    torch's floor-div+clamp without the negative-numerator floor subtlety.
+    ``new_token_nums`` is stored unclamped, matching the eager builder.
+    """
+    offs = tl.arange(0, BLOCK)
+    mask = offs < bs
+    prefix = tl.load(prefix_ptr + offs, mask=mask, other=0)
+    full = prefix + dtn
+
+    t = full - ksize
+    seq_lens_k = tl.where(t >= 0, t // kstride + 1, 0)
+    t = prefix - ksize
+    history = tl.where(t >= 0, t // kstride + 1, 0)
+    new_token = full - history * kstride
+    t = new_token - ksize
+    new_compress = tl.where(t >= 0, t // kstride + 1, 0)
+    total = history + new_compress
+
+    tl.store(history_ptr + offs, history, mask=mask)
+    tl.store(new_token_ptr + offs, new_token, mask=mask)
+    tl.store(new_compress_ptr + offs, new_compress, mask=mask)
+    tl.store(total_ptr + offs, total, mask=mask)
+
+    # Inclusive prefix sums over the valid lanes only; padding lanes are zeroed so
+    # they neither contribute to a valid prefix nor get stored.
+    seq_lens_k = tl.where(mask, seq_lens_k, 0)
+    new_token = tl.where(mask, new_token, 0)
+    new_compress = tl.where(mask, new_compress, 0)
+    total = tl.where(mask, total, 0)
+    tl.store(cu_seqlens_ptr + 1 + offs, tl.cumsum(seq_lens_k, axis=0), mask=mask)
+    tl.store(cu_new_token_ptr + 1 + offs, tl.cumsum(new_token, axis=0), mask=mask)
+    tl.store(cu_new_compress_ptr + 1 + offs, tl.cumsum(new_compress, axis=0), mask=mask)
+    tl.store(cu_total_ptr + 1 + offs, tl.cumsum(total, axis=0), mask=mask)
+
+
+def fill_compress_level_metadata(
+    level: "CompressionLevelMetadata",
+    prefix_seq_lens_i32: torch.Tensor,
+    draft_token_num: int,
+    kernel_size: int,
+    kernel_stride: int,
+    bs: int,
+):
+    """Fill one compression level's count/cumsum buffers in a single launch.
+
+    ``prefix_seq_lens_i32`` is the int32 prefix (history) length per request.
+    The eight target buffers are the CUDA-graph-captured slices on ``level``;
+    they are written in place so graph replay sees the refreshed metadata.
+    """
+    _compress_level_metadata_kernel[(1,)](
+        prefix_seq_lens_i32,
+        level.history_compress_token_nums,
+        level.new_token_nums,
+        level.new_compress_token_nums,
+        level.total_compress_token_nums,
+        level.cu_seqlens,
+        level.cu_new_token_nums,
+        level.cu_new_compress_token_nums,
+        level.cu_total_compress_token_nums,
+        int(draft_token_num),
+        int(kernel_size),
+        int(kernel_stride),
+        int(bs),
+        BLOCK=triton.next_power_of_2(int(bs)),
+    )
+
+
+@triton.jit
+def _verify_plan_counts_kernel(
+    seq_lens_ptr,  # int32 [bs]            prefix seq lens
+    offsets_ptr,  # int32 [token_num]     verify_token_offsets (draft flat index)
+    mask_ptr,  # bool  [token_num*dtn]  sparse_tree_draft_mask (flat)
+    out_ptr,  # int32 [token_num*hg]   num_kv_per_row
+    dtn,
+    block_size,
+    sparse_topk,
+    head_group_num,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """One launch builds the FlashInfer split-KV per-row KV counts.
+
+    Replaces ~18 eager ops (a mask row-sum reduce, two repeat_interleaves, the
+    ``sparse_block_quantized_count`` chain, the subtract/add, the head-group
+    broadcast) with one program per draft token. The per-row count is
+    ``sc(token_pos) - off + popcount`` (see the invariant in
+    ``_refresh_target_verify_graph_metadata``); ``sparse_block_quantized_count``
+    is inlined. All ints fit int32, so this is bit-exact with the int64 eager
+    path (integer ops are exact and values stay well under 2**31).
+    """
+    t = tl.program_id(0)
+    # popcount: visible drafts = sum of this token's dtn tree-mask bits
+    d = tl.arange(0, BLOCK_D)
+    bits = tl.load(mask_ptr + t * dtn + d, mask=d < dtn, other=0).to(tl.int32)
+    num_visible = tl.sum(bits, axis=0)
+
+    seq_len = tl.load(seq_lens_ptr + t // dtn)
+    off = tl.load(offsets_ptr + t)
+    token_pos = seq_len + off
+
+    # inline sparse_block_quantized_count(token_pos)
+    budget = block_size * sparse_topk
+    mod = token_pos % block_size
+    capped = tl.where(mod == 0, budget, (sparse_topk - 1) * block_size + mod)
+    sc = tl.where(token_pos <= budget, token_pos, capped)
+
+    num_kv = sc - off + num_visible
+
+    h = tl.arange(0, BLOCK_H)
+    tl.store(out_ptr + t * head_group_num + h, num_kv, mask=h < head_group_num)
+
+
+def build_verify_plan_counts(
+    seq_lens_i32: torch.Tensor,
+    verify_token_offsets: torch.Tensor,
+    sparse_tree_draft_mask: torch.Tensor,
+    draft_token_num: int,
+    block_size: int,
+    sparse_topk: int,
+    head_group_num: int,
+    token_num: int,
+):
+    """Device ``num_kv_per_row`` for the verify-replay FlashInfer plan, one launch.
+
+    Returns an int32 tensor of length ``token_num * head_group_num`` ready for the
+    synchronous D2H copy into the pinned plan buffer.
+    """
+    out = torch.empty(
+        token_num * head_group_num, dtype=torch.int32, device=seq_lens_i32.device
+    )
+    _verify_plan_counts_kernel[(token_num,)](
+        seq_lens_i32,
+        verify_token_offsets,
+        sparse_tree_draft_mask,
+        out,
+        int(draft_token_num),
+        int(block_size),
+        int(sparse_topk),
+        int(head_group_num),
+        BLOCK_D=triton.next_power_of_2(int(draft_token_num)),
+        BLOCK_H=triton.next_power_of_2(int(head_group_num)),
+    )
+    return out
 
 
 def batched_gather(a, cu_seqlen_q, select):
@@ -968,31 +1141,26 @@ class SparseMetadataBuilder:
 
     def build_token_mappings(
         self,
-        cu_seqlens_q_sparse_bs: torch.Tensor,
         extend_prefix_lens_sparse: torch.Tensor,
         seqlen_q_sparse_bs: list[int],
         sparse_bs_list: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build token mapping tensors for sparse batches.
+        """Per-token maps for the flattened sparse query stream (all on CPU).
 
-        Computes token_to_bs (which batch each token belongs to) and
-        token_pos_in_bs (position of each token within its batch).
+        Each sparse request contributes ``seqlen_q_sparse_bs[i]`` consecutive
+        tokens. ``token_to_bs`` tags each token with its original request id
+        (``sparse_bs_list[i]``); ``token_pos_in_bs`` is the token's 1-based
+        absolute position in that request (``local_index + 1 + prefix_len``).
 
         Args:
-            cu_seqlens_q_sparse_bs: Cumulative sequence lengths for sparse batches
-            extend_prefix_lens_sparse: Extension prefix lengths for sparse batches (size: len(sparse_bs_list))
-            seqlen_q_sparse_bs: Query sequence lengths for sparse batches
+            extend_prefix_lens_sparse: prefix length per sparse request
+                (size len(sparse_bs_list)).
+            seqlen_q_sparse_bs: query length per sparse request.
+            sparse_bs_list: original request ids; defaults to 0..n-1.
 
         Returns:
-            Tuple of (token_to_bs, token_pos_in_bs)
-            - token_to_bs: Tensor mapping each token to its original batch index
-            - token_pos_in_bs: Tensor mapping each token to its position within batch
+            (token_to_bs, token_pos_in_bs), both int32 CPU tensors.
         """
-        # Total number of tokens in sparse batches
-        q_shape_sparse_bs = cu_seqlens_q_sparse_bs[-1].item()
-
-        # Build token_to_bs: which batch each token belongs to
-        token_to_bs = torch.zeros(q_shape_sparse_bs, dtype=torch.int32, device="cpu")
         if sparse_bs_list is None:
             sparse_bs_list = list(range(len(seqlen_q_sparse_bs)))
         elif len(sparse_bs_list) != len(seqlen_q_sparse_bs):
@@ -1000,26 +1168,20 @@ class SparseMetadataBuilder:
                 "sparse_bs_list must have the same length as seqlen_q_sparse_bs; "
                 f"got {len(sparse_bs_list)} and {len(seqlen_q_sparse_bs)}."
             )
-        for i in range(len(seqlen_q_sparse_bs)):
-            start = cu_seqlens_q_sparse_bs[i]
-            end = cu_seqlens_q_sparse_bs[i + 1]
-            token_to_bs[start:end] = sparse_bs_list[i]
 
-        # Build token_pos_in_bs: position of each token within its batch
-        token_pos_in_bs = torch.zeros(
-            q_shape_sparse_bs, dtype=torch.int32, device="cpu"
+        seqlens = torch.tensor(seqlen_q_sparse_bs, dtype=torch.int32)
+        token_to_bs = torch.tensor(sparse_bs_list, dtype=torch.int32).repeat_interleave(
+            seqlens
         )
-        for i in range(len(seqlen_q_sparse_bs)):
-            start = cu_seqlens_q_sparse_bs[i]
-            end = cu_seqlens_q_sparse_bs[i + 1]
-            token_pos_in_bs[start:end] = torch.tensor(
-                [
-                    (idx + 1 + extend_prefix_lens_sparse[i].item())
-                    for idx in range(seqlen_q_sparse_bs[i])
-                ],
-                dtype=token_pos_in_bs.dtype,
-                device=token_pos_in_bs.device,
-            )
+
+        # token_pos = global_index - segment_start + 1 + prefix, folded into one
+        # per-segment offset broadcast over the segment's tokens.
+        prefixes = extend_prefix_lens_sparse.to(dtype=torch.int32, device="cpu")
+        segment_starts = seqlens.cumsum(0, dtype=torch.int32) - seqlens
+        offset = 1 + prefixes - segment_starts
+        token_pos_in_bs = torch.arange(
+            int(seqlens.sum()), dtype=torch.int32
+        ) + offset.repeat_interleave(seqlens)
 
         return token_to_bs, token_pos_in_bs
 
@@ -1240,73 +1402,48 @@ class SparseMetadataBuilder:
         bs = forward_batch.batch_size
         seq_lens_cpu_for_sparse = effective_seq_lens_cpu(forward_batch, base_metadata)
 
+        # One pass over the batch decides each request's page-table rows and the
+        # query-position step every row contributes. Sparse requests (and dense
+        # ones under tree verify) are token-major: extend*head_group rows, each a
+        # single query position (step 1). Plain dense requests are head-major:
+        # head_group rows, each spanning the whole extend (step = extend). The
+        # page table is widened to the cache a row can reach -- the pruned topk
+        # for sparse, the full prefix otherwise.
         max_sparse_cache_len = -1
-        sparse_page_table_bs = 0
-        old_bs_to_new_bs_range = [0 for _ in range(bs + 1)]
         sparse_max_seq_len_q = 1
-
+        old_bs_to_new_bs_range = [0] * (bs + 1)
+        row_steps = []
         for i in range(bs):
             seq_len_i = int(seq_lens_cpu_for_sparse[i])
+            extend_i = int(forward_batch.extend_seq_lens_cpu[i])
             if seq_len_i >= dense_len:
+                rows, step = extend_i * head_group_num, 1
                 max_sparse_cache_len = max(
                     max_sparse_cache_len, sparse_topk * block_size
                 )
-                sparse_page_table_bs += (
-                    forward_batch.extend_seq_lens_cpu[i] * head_group_num
-                )
-                old_bs_to_new_bs_range[i + 1] = (
-                    old_bs_to_new_bs_range[i]
-                    + head_group_num * forward_batch.extend_seq_lens_cpu[i]
-                )
             elif tree_mode:
-                # Dense request under tree verify: token-major like a sparse
-                # request, but the page table must hold its full prefix.
+                rows, step = extend_i * head_group_num, 1
                 max_sparse_cache_len = max(max_sparse_cache_len, seq_len_i)
-                sparse_page_table_bs += (
-                    forward_batch.extend_seq_lens_cpu[i] * head_group_num
-                )
-                old_bs_to_new_bs_range[i + 1] = (
-                    old_bs_to_new_bs_range[i]
-                    + head_group_num * forward_batch.extend_seq_lens_cpu[i]
-                )
             else:
+                rows, step = head_group_num, extend_i
                 max_sparse_cache_len = max(max_sparse_cache_len, seq_len_i)
-                sparse_page_table_bs += head_group_num
-                old_bs_to_new_bs_range[i + 1] = (
-                    old_bs_to_new_bs_range[i] + head_group_num
-                )
-                sparse_max_seq_len_q = max(
-                    sparse_max_seq_len_q, forward_batch.extend_seq_lens_cpu[i]
-                )
+                sparse_max_seq_len_q = max(sparse_max_seq_len_q, extend_i)
+            row_steps.append(torch.full((rows,), step, dtype=cu_seqlens_q.dtype))
+            old_bs_to_new_bs_range[i + 1] = old_bs_to_new_bs_range[i] + rows
 
+        sparse_page_table_bs = old_bs_to_new_bs_range[bs]
         sparse_page_table = torch.zeros(
             (sparse_page_table_bs, max_sparse_cache_len),
             dtype=sparse_page_table_dtype,
             device=sparse_page_table_device,
         )
         sparse_cu_seqlens_q_cpu = torch.zeros(
-            (sparse_page_table_bs + 1), dtype=cu_seqlens_q.dtype, device="cpu"
+            sparse_page_table_bs + 1, dtype=cu_seqlens_q.dtype, device="cpu"
         )
-
-        pt = 0
-        for i in range(bs):
-            seq_len_i = int(seq_lens_cpu_for_sparse[i])
-            if seq_len_i >= dense_len or tree_mode:
-                for _ in range(forward_batch.extend_seq_lens_cpu[i] * head_group_num):
-                    sparse_cu_seqlens_q_cpu[pt + 1] = sparse_cu_seqlens_q_cpu[pt] + 1
-                    pt += 1
-            else:
-                for _ in range(head_group_num):
-                    sparse_cu_seqlens_q_cpu[pt + 1] = (
-                        sparse_cu_seqlens_q_cpu[pt]
-                        + forward_batch.extend_seq_lens_cpu[i]
-                    )
-                    pt += 1
-
-        assert (
-            pt == sparse_page_table_bs
-        ), f"sparse_page_table_bs {sparse_page_table_bs} vs pt {pt}"
-
+        if row_steps:
+            sparse_cu_seqlens_q_cpu[1:] = torch.cat(row_steps).cumsum(
+                0, dtype=cu_seqlens_q.dtype
+            )
         sparse_cu_seqlens_q = sparse_cu_seqlens_q_cpu.to(device=cu_seqlens_q.device)
 
         sparse_idx = []

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -207,6 +208,10 @@ class FlashInferKernel(AttentionKernel):
         # Wrappers will be created lazily
         self.decode_wrapper: Optional[BatchDecodeWithPagedKVCacheWrapper] = None
         self.prefill_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
+        # Set once the decode wrapper has resolved its backend / cached plan
+        # module via a standard begin_forward; afterwards plans take the
+        # fast_decode_plan path. See _plan_decode_wrapper.
+        self._decode_plan_warmed = False
 
     def _get_or_create_decode_wrapper(
         self,
@@ -236,6 +241,47 @@ class FlashInferKernel(AttentionKernel):
                 backend="fa2",
             )
         return self.prefill_wrapper
+
+    def _plan_decode_wrapper(
+        self,
+        wrapper: "BatchDecodeWithPagedKVCacheWrapper",
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+    ) -> None:
+        """Plan the shared sparse decode wrapper for one attention call.
+
+        Sparse prefill treats every query token as a one-row paged decode, so
+        the 8 sparse layers each re-plan this wrapper once per chunk. The plan's
+        schedule depends only on the per-row kv lengths (identical across the 8
+        layers — constant topk), so fast_decode_plan hands the C++ scheduler the
+        same arguments as begin_forward — same split-KV schedule, bit-identical
+        output — while skipping begin_forward's Python-side max() over the
+        chunk_tokens*head_group per-row kv lengths, the dominant prefill host
+        cost. The standard entry runs once to resolve the backend and build the
+        cached plan module that fast_decode_plan reuses.
+        """
+        if self._decode_plan_warmed:
+            from flashinfer.decode import fast_decode_plan
+
+            plan = partial(fast_decode_plan, wrapper)
+        else:
+            plan = wrapper.begin_forward
+            self._decode_plan_warmed = True
+        plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            self.head_dim,
+            self.page_size,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
+            non_blocking=True,
+        )
 
     def forward(
         self,
@@ -372,18 +418,16 @@ class FlashInferKernel(AttentionKernel):
                     )
             else:
                 if not using_preconverted:
-                    # Decode wrapper uses indptr, indices
-                    wrapper.begin_forward(
+                    # Decode wrapper uses indptr, indices. After the first
+                    # (backend-resolving) plan this takes the fast_decode_plan
+                    # path; see _plan_decode_wrapper.
+                    self._plan_decode_wrapper(
+                        wrapper,
                         kv_indptr,
                         kv_indices,
                         kv_last_page_len,
                         num_qo_heads,
                         num_kv_heads,
-                        self.head_dim,
-                        self.page_size,
-                        q_data_type=self.q_data_type,
-                        kv_data_type=self.data_type,
-                        non_blocking=True,
                     )
 
         # Perform attention

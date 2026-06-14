@@ -420,7 +420,7 @@ class TestMiniCPMSparseTargetVerify(CustomTestCase):
 
     def _target_verify_graph_backend(self, max_bs=3, draft_token_num=4):
         backend = self._backend()
-        backend.device = torch.device("cpu")
+        backend.device = torch.device("cuda")
         backend.max_context_len = 64
         backend.num_sparse_topk_tokens = 8
         backend.attention_kernel_type = "unit-test-no-wrapper"
@@ -503,7 +503,16 @@ class TestMiniCPMSparseTargetVerify(CustomTestCase):
                 "cu_total_compress_token_nums",
             ):
                 graph[f"{prefix}.{name}"] = torch.zeros(max_bs + 1, dtype=torch.int32)
-        backend.decode_cuda_graph_metadata = graph
+        # The graph-replay metadata fill runs as device Triton kernels, so the
+        # backend buffers and graph static buffers must live on CUDA like in
+        # production.
+        backend.req_to_token = backend.req_to_token.cuda()
+        backend.req_to_sparse_k1_token = backend.req_to_sparse_k1_token.cuda()
+        backend.req_to_sparse_k2_token = backend.req_to_sparse_k2_token.cuda()
+        backend.decode_cuda_graph_metadata = {
+            key: value.cuda() if isinstance(value, torch.Tensor) else value
+            for key, value in graph.items()
+        }
         return backend
 
     def test_target_verify_metadata_uses_prefix_plus_draft_tokens(self):
@@ -663,7 +672,6 @@ class TestMiniCPMSparseTargetVerify(CustomTestCase):
         builder = self._backend().sparse_metadata_builder
 
         token_to_bs, token_pos_in_bs = builder.build_token_mappings(
-            cu_seqlens_q_sparse_bs=torch.tensor([0, 2, 5], dtype=torch.int32),
             extend_prefix_lens_sparse=torch.tensor([10, 20], dtype=torch.int64),
             seqlen_q_sparse_bs=[2, 3],
             sparse_bs_list=[1, 3],
@@ -672,6 +680,7 @@ class TestMiniCPMSparseTargetVerify(CustomTestCase):
         self.assertEqual(token_to_bs.tolist(), [1, 1, 3, 3, 3])
         self.assertEqual(token_pos_in_bs.tolist(), [11, 12, 21, 22, 23])
 
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
     def test_target_verify_cuda_graph_replay_refreshes_eagle_static_metadata(self):
         max_bs = 3
         draft_token_num = 4
@@ -681,12 +690,12 @@ class TestMiniCPMSparseTargetVerify(CustomTestCase):
         )
         metadata = backend._init_target_verify_graph_metadata(
             bs=max_bs,
-            seq_lens=torch.tensor([1, 1, 1], dtype=torch.int64),
-            req_pool_indices=torch.tensor([0, 1, 0], dtype=torch.int64),
+            seq_lens=torch.tensor([1, 1, 1], dtype=torch.int64, device="cuda"),
+            req_pool_indices=torch.tensor([0, 1, 0], dtype=torch.int64, device="cuda"),
             spec_info=capture_spec,
         )
 
-        seq_lens = torch.tensor([10, 20, 1], dtype=torch.int64)
+        seq_lens = torch.tensor([10, 20, 1], dtype=torch.int64, device="cuda")
         draft_masks = torch.tensor(
             [
                 [
@@ -703,6 +712,7 @@ class TestMiniCPMSparseTargetVerify(CustomTestCase):
                 ],
             ],
             dtype=torch.bool,
+            device="cuda",
         )
         full_masks = []
         for prefix_len, draft_mask in zip(seq_lens[:2].tolist(), draft_masks):
@@ -710,6 +720,7 @@ class TestMiniCPMSparseTargetVerify(CustomTestCase):
                 draft_token_num,
                 prefix_len + draft_token_num,
                 dtype=torch.bool,
+                device="cuda",
             )
             full_mask[:, prefix_len : prefix_len + draft_token_num] = draft_mask
             full_masks.append(full_mask.flatten())
@@ -721,7 +732,7 @@ class TestMiniCPMSparseTargetVerify(CustomTestCase):
         backend._refresh_target_verify_graph_metadata(
             metadata,
             bs=max_bs,
-            req_pool_indices=torch.tensor([0, 1, 0], dtype=torch.int64),
+            req_pool_indices=torch.tensor([0, 1, 0], dtype=torch.int64, device="cuda"),
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             spec_info=replay_spec,
