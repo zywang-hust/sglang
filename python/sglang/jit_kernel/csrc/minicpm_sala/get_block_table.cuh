@@ -137,12 +137,19 @@ __global__ void get_block_table_cuda_v3(
   const int topk_idx_in_head = bidx % kBlockPerTokenHead * kTopkPerBlock + tidx / kSparseBlockSize;
 
   const int sparse_block_idx = topk_idx_share[tidx / kSparseBlockSize];
-
-  const int token_idx_src = sparse_block_idx * kSparseBlockSize + tidx % kSparseBlockSize;
   const int token_idx_dst = token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize +
                             head_group_idx * kSparseTopK * kSparseBlockSize + topk_idx_in_head * kSparseBlockSize +
                             tidx % kSparseBlockSize;
 
+  // EAGLE tree verify emits -1-padded topk rows. Treat a negative block id as
+  // padding and write 0, instead of computing a negative token_idx_src and
+  // reading block_table out of bounds (v1/v2 already guard this; v3 did not).
+  if (sparse_block_idx < 0) {
+    out_block_table[token_idx_dst] = 0;
+    return;
+  }
+
+  const int token_idx_src = sparse_block_idx * kSparseBlockSize + tidx % kSparseBlockSize;
   const int bs = token_to_bs[token_idx];
   const int pos_in_bs = token_pos_in_bs[token_idx];
   const int seqlen_q_bs = seqlen_q[bs];

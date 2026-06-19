@@ -37,11 +37,7 @@ def _make_inputs(token_num, seqlen_q_max, topk, batch_size=1, device="cuda"):
 
 
 def _make_valid_inputs(token_num, seqlen_q_max, topk, batch_size=1, device="cuda"):
-    """Build well-formed inputs with only non-negative block indices.
-
-    The original v3 kernel (unlike v1/v2) has no ``sparse_block_idx < 0`` guard,
-    so the three variants only provably agree when every topk entry is valid.
-    """
+    """Build well-formed inputs with only non-negative block indices."""
     num_blocks = seqlen_q_max // _SPARSE_BLOCK_SIZE
     torch.manual_seed(0)
     topk_idx = torch.randint(
@@ -91,18 +87,23 @@ def test_get_block_table_v2_golden(topk):
 
 @pytest.mark.parametrize("topk", [96, 128])
 def test_get_block_table_versions_agree(topk):
-    """v1, v2, v3 must produce identical block tables for well-formed input.
+    """v1, v2, v3 must produce identical block tables.
 
-    Uses only non-negative block indices because the original v3 kernel has no
-    ``sparse_block_idx < 0`` guard (so the variants only agree on valid inputs).
+    Both well-formed input and -1-padded topk rows are checked. v3 now carries
+    the same ``sparse_block_idx < 0`` guard as v1/v2 -- it writes 0 for padding
+    instead of reading out of bounds -- so all three agree on the padded rows
+    that EAGLE target verify produces.
     """
     token_num, seqlen_q_max = 2048, 2048
-    inputs = _make_valid_inputs(token_num, seqlen_q_max, topk)
-    out1 = get_block_table_v1(*inputs)
-    out2 = get_block_table_v2(*inputs)
-    out3 = get_block_table_v3(*inputs)
-    assert torch.equal(out1, out2)
-    assert torch.equal(out1, out3)
+    for inputs in (
+        _make_valid_inputs(token_num, seqlen_q_max, topk),
+        _make_inputs(token_num, seqlen_q_max, topk),
+    ):
+        out1 = get_block_table_v1(*inputs)
+        out2 = get_block_table_v2(*inputs)
+        out3 = get_block_table_v3(*inputs)
+        assert torch.equal(out1, out2)
+        assert torch.equal(out1, out3)
 
 
 @pytest.mark.parametrize("topk", [96, 128])
