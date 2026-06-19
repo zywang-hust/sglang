@@ -1839,6 +1839,12 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 "Install it or configure the model to use a supported attention backend (e.g., Mamba2)."
             )
 
+        # Per-forward, layer-invariant scalars hoisted out of forward()'s
+        # per-layer hot path; refreshed once per forward in
+        # init_forward_metadata. See _hoist_extend_scalars / forward.
+        self._extend_has_prefix = False
+        self._extend_max_seq_len = 0
+
     def _get_mamba_indices(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Get mamba cache indices with fallback logic.
 
@@ -1892,9 +1898,38 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         """
         return None
 
+    def _hoist_extend_scalars(self, forward_batch: ForwardBatch):
+        """Compute the per-forward, layer-invariant extend scalars once.
+
+        forward() runs per GLA layer (24 per chunk). Two of its decisions —
+        whether any request carries a cached prefix (initial-state load) and the
+        extend length that picks the fused_recurrent/chunk kernel — are the same
+        for every layer, but evaluating them on the device tensors forces a
+        GPU->CPU sync each time, which dominates prefill host time. Reading the
+        CPU mirrors here once keeps the per-layer path sync-free; the device
+        tensors are the fallback for the gpu_only batch path that leaves the
+        mirrors unset (still one sync per forward instead of 24).
+        """
+        prefix_cpu = forward_batch.extend_prefix_lens_cpu
+        if prefix_cpu is not None:
+            self._extend_has_prefix = any(p > 0 for p in prefix_cpu)
+        elif forward_batch.extend_prefix_lens is not None:
+            self._extend_has_prefix = bool((forward_batch.extend_prefix_lens > 0).any())
+        else:
+            self._extend_has_prefix = False
+
+        seq_cpu = forward_batch.extend_seq_lens_cpu
+        if seq_cpu is not None and len(seq_cpu) > 0:
+            self._extend_max_seq_len = int(max(seq_cpu))
+        elif forward_batch.extend_seq_lens is not None:
+            self._extend_max_seq_len = int(torch.max(forward_batch.extend_seq_lens))
+        else:
+            self._extend_max_seq_len = 0
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = metadata
+        self._hoist_extend_scalars(forward_batch)
 
     # CUDA graph capture/replay is inherited from
     # MambaAttnBackendBase.init_forward_metadata_out_graph, which routes both
@@ -1921,10 +1956,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         if (
             forward_batch.forward_mode.is_decode()
             or is_target_verify
-            or (
-                forward_batch.extend_prefix_lens is not None
-                and (forward_batch.extend_prefix_lens > 0).any()
-            )
+            or self._extend_has_prefix
         ):
             cache_idx, layer_cache = self._mamba_layer_cache(layer_id)
             if is_target_verify:
@@ -1982,7 +2014,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
             seq_len = (
                 1
                 if forward_batch.forward_mode.is_decode()
-                else torch.max(forward_batch.extend_seq_lens)
+                else self._extend_max_seq_len
             )
             mode = "fused_recurrent" if seq_len < 64 else "chunk"
             if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
