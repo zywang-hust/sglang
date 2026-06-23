@@ -533,6 +533,9 @@ class MiniCPMModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -626,6 +629,12 @@ class MiniCPMSALAForCausalLM(nn.Module):
             head = self.lm_head.weight
         return self.model.embed_tokens.weight, head
 
+    def get_input_embeddings(self) -> nn.Module:
+        # DFlash draft has no embedding of its own; it embeds block_ids with the
+        # target's table. The scale_emb factor applied in forward() is NOT applied
+        # here, so callers that need scaled embeddings must scale themselves.
+        return self.model.get_input_embeddings()
+
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         num_layers = self.config.num_hidden_layers
         if layer_ids is None:
@@ -650,6 +659,23 @@ class MiniCPMSALAForCausalLM(nn.Module):
             layers_to_capture = [val + 1 for val in layer_ids]
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = layers_to_capture
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        # DFlash always names its target capture layers explicitly (no default).
+        # The validation and +1 mapping are identical to the EAGLE3 path above;
+        # both write the same self.model.layers_to_capture.
+        if not layer_ids:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        num_layers = self.config.num_hidden_layers
+        if any(layer_id < 0 or layer_id >= num_layers for layer_id in layer_ids):
+            raise ValueError(
+                "MiniCPM DFLASH capture layer ids must be in "
+                f"0..{num_layers - 1}; got {layer_ids}."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
