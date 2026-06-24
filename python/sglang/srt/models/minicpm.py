@@ -636,44 +636,22 @@ class MiniCPMSALAForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        num_layers = self.config.num_hidden_layers
         if layer_ids is None:
-            # Default capture points expressed directly as capture-loop indices
-            # (the +1 convention below does not apply here), mirroring upstream
-            # llama_eagle3's [2, n // 2, n - 3] default.
-            layers_to_capture = [2, num_layers // 2, num_layers - 3]
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
-            if not layer_ids:
-                raise ValueError(
-                    "MiniCPM EAGLE3 capture requires at least one layer id."
-                )
-            if any(layer_id < 0 or layer_id >= num_layers for layer_id in layer_ids):
-                raise ValueError(
-                    "MiniCPM EAGLE3 capture layer ids must be in "
-                    f"0..{num_layers - 1}; got {layer_ids}."
-                )
-            # The configured ids name target layers; capture happens at the next
-            # layer input where the previous layer output is available. The +1
-            # keeps every mapped index within 0..num_layers, so no further
-            # bound check is needed.
-            layers_to_capture = [val + 1 for val in layer_ids]
-        self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = layers_to_capture
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        # DFlash always names its target capture layers explicitly (no default).
-        # The validation and +1 mapping are identical to the EAGLE3 path above;
-        # both write the same self.model.layers_to_capture.
-        if not layer_ids:
+        if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
-        num_layers = self.config.num_hidden_layers
-        if any(layer_id < 0 or layer_id >= num_layers for layer_id in layer_ids):
-            raise ValueError(
-                "MiniCPM DFLASH capture layer ids must be in "
-                f"0..{num_layers - 1}; got {layer_ids}."
-            )
+
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 

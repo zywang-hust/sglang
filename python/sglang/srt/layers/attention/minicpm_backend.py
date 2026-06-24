@@ -1909,18 +1909,37 @@ class MiniCPMSparseBackend(AttentionBackend):
         to avoid memory allocations.
         """
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        # The K1/K2 compressed-cache CUDA-graph buffers are capture-copied from the
+        # request tables in full (_refresh_target_verify_graph_metadata's
+        # copy_compress_metadata), so they must be exactly as wide. The request
+        # tables are sized for context_len + get_req_to_token_extra_context_len (the
+        # decode / spec over-allocation headroom; model_runner_kv_cache_mixin), so
+        # recomputing the width from context_len alone undercounts by
+        # floor(extra / kernel_stride): 0 for EAGLE's small draft footprint, but 1
+        # for a DFLASH block (block_size == kernel_stride), which fails capture.
+        # Take the widths straight from the tables so the two cannot diverge.
         max_k1_num_pages = (
-            (self.max_context_len - self.k1_kernel_size) // self.k1_kernel_stride
-            + 1
-            + self.page_size
-            - 1
-        ) // self.page_size
+            self.req_to_sparse_k1_token.shape[1]
+            if self.req_to_sparse_k1_token is not None
+            else (
+                (self.max_context_len - self.k1_kernel_size) // self.k1_kernel_stride
+                + 1
+                + self.page_size
+                - 1
+            )
+            // self.page_size
+        )
         max_k2_num_pages = (
-            (self.max_context_len - self.k2_kernel_size) // self.k2_kernel_stride
-            + 1
-            + self.page_size
-            - 1
-        ) // self.page_size
+            self.req_to_sparse_k2_token.shape[1]
+            if self.req_to_sparse_k2_token is not None
+            else (
+                (self.max_context_len - self.k2_kernel_size) // self.k2_kernel_stride
+                + 1
+                + self.page_size
+                - 1
+            )
+            // self.page_size
+        )
         sparse_max_num_pages = (
             self.num_sparse_topk_tokens + self.page_size - 1
         ) // self.page_size
@@ -2486,6 +2505,16 @@ class MiniCPMSparseBackend(AttentionBackend):
             # boundaries (a chain has popcount == off, a tree popcount < off).
             # Derived empirically against the compaction kernel; re-derive if the
             # compaction or the draft layout changes.
+            #
+            # DFlash (topk=1) differs: its worker sets custom_mask=None, so
+            # _copy_eagle_draft_tree_mask fills the draft mask all-True and
+            # popcount == dtn (not off), giving plan A = sc(token_pos) - off + dtn.
+            # No compaction runs here; attention reads B =
+            # _derive_sparse_cache_seqlens_from_topk, which the local-window
+            # frontier invariant makes equal sc(token_pos). So A - B == dtn - off
+            # >= 0 row-wise: A is a split-KV reduction upper bound, not a bit-match,
+            # and the read range stays B (verified token-exact under pinned
+            # split-KV).
             # Fused into one launch: the mask row-sum (popcount), the per-token
             # token_pos, the inlined sparse_block_quantized_count, and the
             # head-group broadcast. Reuses graph["verify_token_offsets"] (the same

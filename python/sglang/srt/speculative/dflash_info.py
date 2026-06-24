@@ -10,7 +10,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
+    alloc_sparse_compressed_slots_for_range,
     alloc_token_slots,
+    free_sparse_compressed_slots_for_range,
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -230,6 +232,25 @@ class DFlashVerifyInput(SpecInput):
             batch.out_cache_loc,
             bs,
         )
+
+        if batch.model_config.has_sparse_attention:
+            # MiniCPM sparse target verify reads compressed K1/K2 slots for the
+            # [seq_len, seq_len + draft_token_num) range this block verifies. Like
+            # EAGLE v1 (eagle_info.py) DFlash must register them before verify and
+            # free the rejected tail afterwards (in `verify`). Without it the
+            # request K1/K2 table rows stay zero and cache_finished_req later frees
+            # the reserved padding slot 0 -> KV pool leak.
+            end_offset_cpu = batch.seq_lens_cpu + self.draft_token_num
+            (
+                batch.token_num_sparse_k1_cpu,
+                batch.token_num_sparse_k2_cpu,
+            ) = alloc_sparse_compressed_slots_for_range(
+                batch.tree_cache,
+                batch.req_to_token_pool,
+                [req.req_pool_idx for req in batch.reqs],
+                batch.seq_lens_cpu,
+                end_offset_cpu,
+            )
 
         if not build_custom_mask:
             self.custom_mask = None
@@ -491,6 +512,23 @@ class DFlashVerifyInput(SpecInput):
 
             keep_mask = row_offsets < commit_lens[:, None]
             batch.out_cache_loc = out_cache_loc[keep_mask]
+
+        if batch.model_config.has_sparse_attention:
+            # Trim the sparse K1/K2 slots for the rejected tail, mirroring the
+            # dense free above and EAGLE v1 (eagle_info.py). prepare_for_verify
+            # allocated [seq_len, seq_len + draft_token_num); only
+            # [seq_len, seq_len + commit_len) is committed. seq_lens_cpu is still
+            # pre-verify here (it is advanced below).
+            pre_verify_seq_lens = batch.seq_lens_cpu.tolist()
+            for req, start_len, commit_len in zip(
+                batch.reqs, pre_verify_seq_lens, commit_lens_cpu, strict=True
+            ):
+                free_sparse_compressed_slots_for_range(
+                    batch.tree_cache,
+                    req.req_pool_idx,
+                    start_len + commit_len,
+                    start_len + self.draft_token_num,
+                )
 
         # Update req-level KV cache accounting.
         for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):

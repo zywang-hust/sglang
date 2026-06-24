@@ -10,6 +10,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
+    alloc_sparse_compressed_slots_for_range,
     alloc_token_slots,
     get_last_loc,
 )
@@ -257,6 +258,26 @@ class DFlashDraftInputV2(SpecInput):
                     out_cache_loc,
                     bs,
                 )
+
+                if batch.model_config.has_sparse_attention:
+                    # Register MiniCPM sparse K1/K2 slots for the over-allocated
+                    # [cur, nxt) range, mirroring EAGLE v2 (eagle_info_v2.py).
+                    # DFlash over-allocates dense KV here but never registered the
+                    # matching compressed slots, so the request K1/K2 rows stayed
+                    # zero and release_kv_cache later freed the reserved padding
+                    # slot 0 -> KV pool leak. Unlike v1 there is no per-round free:
+                    # the monotone over-allocation is reclaimed once when the
+                    # request leaves (release_kv_cache).
+                    (
+                        batch.token_num_sparse_k1_cpu,
+                        batch.token_num_sparse_k2_cpu,
+                    ) = alloc_sparse_compressed_slots_for_range(
+                        batch.tree_cache,
+                        batch.req_to_token_pool,
+                        [req.req_pool_idx for req in batch.reqs],
+                        cur_kv_lens_cpu_t,
+                        nxt_kv_lens_cpu_t,
+                    )
         if caller_stream is not None:
             # Enqueue the dependency on the caller's stream, not inside the
             # plan-stream context, so forward work cannot observe partially
