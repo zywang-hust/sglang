@@ -115,6 +115,13 @@ int64_t cutlass_mla_get_workspace_size(
 /*
  * From csrc/infllm_v2
  */
+/**
+ * \brief Max-pool packed stage-1 block scores into per-block scores.
+ * \param input Score buffer [num_heads, total_q, row_stride]; the key axis is
+ *        allocated rounded up to a multiple of 128 by the stage-1 kernel.
+ * \param max_seqlen_k Row stride of input, i.e. input.size(2), not a sequence
+ *        length; rows past cu_seqlens_k are padding.
+ */
 void infllm_v2_max_pooling_1d_varlen(
     at::Tensor input,
     at::Tensor output,
