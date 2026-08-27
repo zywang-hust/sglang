@@ -318,8 +318,15 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, cudaStream_t stream)
       run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(
           params, stream);
     } else {
-      run_flash_splitkv_fwd_stage1<Flash_fwd_kernel_traits<Headdim, 16, 64, 1, false, false, T>, Is_causal>(
-          params, stream);
+      // Causal prefill packs 16 query rows per token, so kBlockM=64 reuses each K-tile across four query groups;
+      // non-causal decode has only 16 rows per sequence, which would idle three of four warps.
+      if constexpr (Is_causal) {
+        run_flash_splitkv_fwd_stage1<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_causal>(
+            params, stream);
+      } else {
+        run_flash_splitkv_fwd_stage1<Flash_fwd_kernel_traits<Headdim, 16, 64, 1, false, false, T>, Is_causal>(
+            params, stream);
+      }
     }
   } else if (params.cu_seqlens_q != nullptr) {
     constexpr static int kBlockM = 16;
