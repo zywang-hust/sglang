@@ -49,20 +49,14 @@ __forceinline__ __device__ void thread_element_wise_reduce_(Tensor<Engine0, Layo
 }
 
 template <typename Element, typename E1, typename L1, typename E2, typename L2>
-__forceinline__ __device__ void hdim16_reduce(
-    Tensor<E1, L1>& acc_S,
-    Tensor<E2, L2>& g_Sh,
-    const int col_idx_offset_,
-    const int row_idx_offset_,
-    const int warp_row_stride) {
+__forceinline__ __device__ void
+hdim16_reduce(Tensor<E1, L1>& acc_S, Tensor<E2, L2>& g_Sh, const int warp_row_stride, const int valid_rows) {
   // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) (or (_2,_2),_2,_16) for D=32) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
   auto tensor = make_tensor(acc_S.data(), flash::convert_layout_acc_rowcol(acc_S.layout()));
   const int warp_id = threadIdx.x / 32;
   const int lane_id = threadIdx.x % 32;
-  // const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
-  // const int row_idx_offset = row_idx_offset_ + warp_id * 16 + lane_id / 4;
-  const int col_idx_offset = 0 + (lane_id % 4) * 2;
-  const int row_idx_offset = 0 + warp_id * 16 + lane_id / 4;
+  const int col_idx_offset = (lane_id % 4) * 2;
+  const int row_idx_offset = warp_id * 16 + lane_id / 4;
 
   // step 1: 线程内部求和 (v0 + v2)
   using TensorT = decltype(make_tensor<float>(Shape<Int<size<0, 1>(tensor)>, Int<size<1>(tensor)>>{}));
@@ -93,15 +87,20 @@ __forceinline__ __device__ void hdim16_reduce(
   if (lane_id < 4) {
 #pragma unroll
     for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+      // kBlockM=64 can straddle the varlen sequence end:
+      // block-local rows at or past valid_rows map to P rows of the next sequence,
+      // or past the buffer for the last one, so they must not be written.
       const int row_idx_base = row_idx_offset + mi * warp_row_stride;
+      if (row_idx_base < valid_rows) {
 #pragma unroll
-      for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-        const int col_idx_base = col_idx_offset + nj * 8;
+        for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+          const int col_idx_base = col_idx_offset + nj * 8;
 #pragma unroll
-        for (int j = 0; j < size<1, 0>(tensor); ++j) {
-          const int col_idx = col_idx_base + j;
-          const int col_idx_v02 = j * size<1, 1>(tensor) + nj;
-          g_Sh(row_idx_base / 16, col_idx) = converter(v02(mi, col_idx_v02));  // ignore /16 since it's too slow
+          for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            const int col_idx = col_idx_base + j;
+            const int col_idx_v02 = j * size<1, 1>(tensor) + nj;
+            g_Sh(row_idx_base / 16, col_idx) = converter(v02(mi, col_idx_v02));
+          }
         }
       }
     }
@@ -1966,7 +1965,7 @@ inline __device__ void compute_attn_1rowblock_splitkv_stage1(
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
 
         if (params.p_ptr != nullptr) {
-          hdim16_reduce<Element>(acc_s, gP, n_block * kBlockN, m_block * kBlockM, kNWarps * 16);
+          hdim16_reduce<Element>(acc_s, gP, kNWarps * 16, binfo.actual_seqlen_q - m_block * kBlockM);
           gP.data() = gP.data() + (-kBlockN);
         }
       }
@@ -2037,7 +2036,7 @@ inline __device__ void compute_attn_1rowblock_splitkv_stage1(
       // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
 
       if (params.p_ptr != nullptr) {
-        hdim16_reduce<Element>(acc_s, gP, n_block * kBlockN, m_block * kBlockM, kNWarps * 16);
+        hdim16_reduce<Element>(acc_s, gP, kNWarps * 16, binfo.actual_seqlen_q - m_block * kBlockM);
         gP.data() = gP.data() + (-kBlockN);
       }
     }
