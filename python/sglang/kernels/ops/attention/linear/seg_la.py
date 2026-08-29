@@ -575,7 +575,67 @@ def seg_la_d_kernel(
     tl.store(s_ptrs, state.to(S.dtype.element_ty))
 
 
-# used for MTP with only spec-topk=1.
+@triton.jit
+def _load_tree_links(
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    bid,
+    stride_retrieve_next_token_seq,
+    stride_retrieve_next_token_token,
+    stride_retrieve_next_sibling_seq,
+    stride_retrieve_next_sibling_token,
+    step,
+    NP2_STEP: tl.constexpr,
+):
+    token_indices = tl.arange(0, NP2_STEP)
+    # Links come from build_tree_kernel_efficient (first child / next sibling).
+    next_tokens = tl.load(
+        retrieve_next_token_ptr
+        + bid * stride_retrieve_next_token_seq
+        + token_indices * stride_retrieve_next_token_token,
+        mask=token_indices < step,
+    )
+    next_siblings = tl.load(
+        retrieve_next_sibling_ptr
+        + bid * stride_retrieve_next_sibling_seq
+        + token_indices * stride_retrieve_next_sibling_token,
+        mask=token_indices < step,
+    )
+    # Unreferenced tokens default to parent 0, so the all-zero capture buffers still
+    # load an in-bounds snapshot; token 0 never reads its entry (i != 0 guard).
+    parent_idx_tokens = tl.zeros((NP2_STEP,), tl.int32)
+    return token_indices, next_tokens, next_siblings, parent_idx_tokens
+
+
+@triton.jit
+def _advance_tree_parent(
+    i,
+    token_indices,
+    next_tokens,
+    next_siblings,
+    parent_idx_tokens,
+    c_base,
+    state,
+    snapshot_stride,
+):
+    parent_step = tl.sum(tl.where(token_indices == i, parent_idx_tokens, 0))
+    if i != 0:
+        # token 0 keeps the persistent state;
+        # later tokens restart from the parent snapshot stored earlier (parent < i).
+        state = tl.load(c_base + parent_step * snapshot_stride).to(tl.float32)
+    next_token = tl.sum(tl.where(token_indices == i, next_tokens, 0))
+    if next_token != -1:
+        parent_idx_tokens = tl.where(token_indices == next_token, i, parent_idx_tokens)
+    next_sibling = tl.sum(tl.where(token_indices == i, next_siblings, 0))
+    if next_sibling != -1:
+        parent_idx_tokens = tl.where(
+            token_indices == next_sibling, parent_step, parent_idx_tokens
+        )
+    return parent_idx_tokens, state
+
+
+# MTP verify; HAS_TREE restarts each token from its parent's CACHES snapshot.
+# Parent walk mirrors kernels/ops/mamba/causal_conv1d_triton.py.
 @triton.jit
 def seg_la_mtp_kernel(
     Q,
@@ -595,9 +655,17 @@ def seg_la_mtp_kernel(
     cache_indices,
     decay_scales,
     step,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    stride_retrieve_next_token_seq,
+    stride_retrieve_next_token_token,
+    stride_retrieve_next_sibling_seq,
+    stride_retrieve_next_sibling_token,
     HEAD_DIM: tl.constexpr,
     K_SPLIT_DIM: tl.constexpr,
     V_SPLIT_DIM: tl.constexpr,
+    NP2_STEP: tl.constexpr,
+    HAS_TREE: tl.constexpr,
 ):
     bid = tl.program_id(0)
     hid = tl.program_id(1)
@@ -641,7 +709,7 @@ def seg_la_mtp_kernel(
     state = tl.load(s_ptrs).to(tl.float32)
     # (bs, step, kv_heads, d, d)
     cache_indices = tl.load(cache_indices + bid)
-    c_ptrs = (
+    c_base = (
         CACHES
         + cache_indices * stride_c
         + hid * HEAD_DIM * HEAD_DIM
@@ -649,8 +717,34 @@ def seg_la_mtp_kernel(
         + vid * V_SPLIT_DIM
         + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
     )
+    c_ptrs = c_base
+
+    if HAS_TREE:
+        token_indices, next_tokens, next_siblings, parent_idx_tokens = _load_tree_links(
+            retrieve_next_token_ptr=retrieve_next_token_ptr,
+            retrieve_next_sibling_ptr=retrieve_next_sibling_ptr,
+            bid=bid,
+            stride_retrieve_next_token_seq=stride_retrieve_next_token_seq,
+            stride_retrieve_next_token_token=stride_retrieve_next_token_token,
+            stride_retrieve_next_sibling_seq=stride_retrieve_next_sibling_seq,
+            stride_retrieve_next_sibling_token=stride_retrieve_next_sibling_token,
+            step=step,
+            NP2_STEP=NP2_STEP,
+        )
 
     for i in range(step):
+        if HAS_TREE:
+            parent_idx_tokens, state = _advance_tree_parent(
+                i=i,
+                token_indices=token_indices,
+                next_tokens=next_tokens,
+                next_siblings=next_siblings,
+                parent_idx_tokens=parent_idx_tokens,
+                c_base=c_base,
+                state=state,
+                snapshot_stride=H * HEAD_DIM * HEAD_DIM,
+            )
+
         q = tl.load(q_ptrs).to(tl.float32) * softmax_scale
         k = tl.load(k_ptrs).to(tl.float32)
         v = tl.load(v_ptrs).to(tl.float32)
@@ -689,6 +783,8 @@ def seg_la_fwd(
     meta,
     caches=None,
     cache_indices=None,
+    retrieve_next_token=None,
+    retrieve_next_sibling=None,
     track_lens=None,
     track_state_indices=None,
     softmax_scale=None,
@@ -726,6 +822,7 @@ def seg_la_fwd(
             EVEN = False
             BLOCK = 32
             step = length // bs
+            HAS_TREE = retrieve_next_token is not None
 
             seg_la_mtp_kernel[grid](
                 q,
@@ -745,9 +842,25 @@ def seg_la_fwd(
                 cache_indices,
                 decay_scales,
                 step,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                stride_retrieve_next_token_seq=(
+                    retrieve_next_token.stride(0) if HAS_TREE else 0
+                ),
+                stride_retrieve_next_token_token=(
+                    retrieve_next_token.stride(1) if HAS_TREE else 0
+                ),
+                stride_retrieve_next_sibling_seq=(
+                    retrieve_next_sibling.stride(0) if HAS_TREE else 0
+                ),
+                stride_retrieve_next_sibling_token=(
+                    retrieve_next_sibling.stride(1) if HAS_TREE else 0
+                ),
                 HEAD_DIM=HEAD_DIM,
                 K_SPLIT_DIM=K_SPLIT_DIM,
                 V_SPLIT_DIM=V_SPLIT_DIM,
+                NP2_STEP=triton.next_power_of_2(step),
+                HAS_TREE=HAS_TREE,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
