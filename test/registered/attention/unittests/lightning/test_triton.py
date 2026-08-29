@@ -41,13 +41,8 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
             prefix_lens=(14, 15, 16),
         ),
     )
-    # Lightning's `seg_la` kernel processes draft tokens as a chain — it
-    # has no parent-indices / retrieve-index plumbing for tree-shaped
-    # drafts (see `linear/seg_la.py`). Tree verify (topk>1) is therefore
-    # structurally unsupported and intentionally omitted; only the
-    # chain (topk=1) shape is covered. The non-EAGLE chain spec kinds
-    # (frozen_kv_mtp, dflash, ngram) match the chain-only contract and
-    # pass against the seg_la recurrence reference.
+    # EAGLE verify covers chain (topk=1) and tree (topk=2, 3 draft tokens);
+    # all cases are checked against the seg_la recurrence reference.
     EAGLE_VERIFY_CASES = (
         (
             LightningAttentionCase(
@@ -60,6 +55,19 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
+        ),
+        (
+            LightningAttentionCase(
+                name="runner_eagle_verify_lightning_tree",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            2,
             "eagle",
         ),
         (
@@ -114,6 +122,19 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
+        ),
+        (
+            LightningAttentionCase(
+                name="runner_cuda_graph_eagle_verify_lightning_tree",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            2,
             "eagle",
         ),
     )
@@ -257,7 +278,7 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
 
     # PCG/BCG split-op extend is deliberately NOT covered. Lightning's
     # backend `forward_extend` flattens the output via `o.view(-1,
-    # tp_q_head_num * v_head_dim)` (`lightning_backend.py:335`), so eager
+    # tp_q_head_num * v_head_dim)` (`lightning_backend.py:447`), so eager
     # forward returns flat `[T, num_heads * head_dim]`. But under
     # piecewise CG (the split-op path), `RadixAttention.forward` writes
     # through `output = torch.empty_like(q)` of per-head shape

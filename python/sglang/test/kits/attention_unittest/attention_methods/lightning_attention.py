@@ -34,7 +34,8 @@ from sglang.srt.runtime_context import get_context, get_parallel
 _parallel_override = get_parallel().override(attn_tp_size=1, attn_tp_rank=0)
 _parallel_override.__enter__()
 
-# seg_la kernel constraints (see seg_la.py:683-694):
+# seg_la kernel constraints
+# (see the seg_la_fwd launcher in kernels/ops/attention/linear/seg_la.py):
 #   - decode (`seg_la_d_kernel`): K_SPLIT_DIM = 128, so head_dim must be >= 128
 #     for `k_dim_block = head_dim // K_SPLIT_DIM` to be at least 1.
 #   - prefill with bs > 2 (`seg_la_p_kernel`): V_SPLIT_DIM = 64, so head_dim must
@@ -225,6 +226,7 @@ class MockLightningModelRunner(ModelRunner):
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        topk: int = 1,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -273,7 +275,9 @@ class MockLightningModelRunner(ModelRunner):
             max_running_requests=None,
             revision=None,
             speculative_algorithm=None,
-            speculative_eagle_topk=1 if case.forward_mode.is_target_verify() else 0,
+            speculative_eagle_topk=(
+                topk if case.forward_mode.is_target_verify() else 0
+            ),
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
@@ -552,6 +556,9 @@ def build_lightning_attention_fixture(
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
+    # Tree-verify cases must pass their topk:
+    # the backend fixes chain vs tree path from server_args at construction.
+    topk: int = 1,
 ) -> LightningAttentionFixture:
     seed = 4096 + len(case.name)
     torch.manual_seed(seed)
@@ -573,6 +580,7 @@ def build_lightning_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        topk=topk,
     )
     try:
         # Validate the named full backend can be constructed (matches GDN/KDA pattern);

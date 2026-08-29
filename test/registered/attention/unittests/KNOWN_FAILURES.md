@@ -6,7 +6,7 @@ unit-test suite, **organized by the action needed to address it**.
 
 Anything failing that is not listed here should be treated as a regression.
 
-Last updated: 2026-06-05
+Last updated: 2026-08-30
 
 ## Reference runs
 
@@ -148,12 +148,11 @@ fixture investigation; no test in the suite).
 
 | Backend | Spec mode/kind | Status | Root cause |
 |---|---|---|---|
-| Mamba2 | tree verify (`topk > 1`) | `[gated]` `speculative_target_verify_runner.py:1214,1276` | SSM kernel ignores tree masks and processes drafts linearly |
+| Mamba2 | tree verify (`topk > 1`) | `[gated]` `speculative_target_verify_runner.py:1279,1341` | SSM kernel ignores tree masks and processes drafts linearly |
 | FlashInfer MLA | non-EAGLE chain verify (frozen_kv_mtp / dflash / ngram) | `[no test]` (`mla/README.md`) | `forward_extend` reads EAGLE-specific `spec_info` attrs; trips CUDA illegal-memory access on non-EAGLE attrs |
 | FlashMLA | non-EAGLE chain verify | `[no test]` (`mla/README.md`) | Same as FlashInfer MLA (inherits) |
 | FlashInfer SWA | non-EAGLE chain verify | `[no test]` (`swa/README.md`) | `FlashInferIndicesUpdaterPrefill.update_sliding_window` rejects `prefix_lens=None` which non-EAGLE paths supply (`flashinfer_backend.py:742,754,1316`) |
 | KDA | non-EAGLE chain verify | `[no test]` (`kda/test_triton.py`, per-case `atol=0.2` attempted) | 1/384 elements at ~0.11 max diff vs `KDA_ATOL=0.1`; needs kind-specific reference tolerance |
-| Lightning | tree verify (`topk > 1`) | `[no test]` (`lightning/README.md`) | `linear/seg_la.py` has no parent-indices / retrieve-index plumbing |
 | FA3 / FA4 | EAGLE tree verify (`topk = 2`) | `[no test]` (`dense/README.md`) | ~0.16 abs-diff bf16 eager-path drift; kernel-level numerical |
 | DSV4 | tree verify (`topk > 1`) | `[no test]` (`dsv4/README.md`) | `assert self.topk in [0, 1]` at `deepseek_v4_backend.py:369` |
 
@@ -163,7 +162,7 @@ fixture investigation; no test in the suite).
 |---|---|---|---|
 | FlashInfer MLA | EAGLE draft CG, chain | `[gated on SM≥10]` `mla/test_flashinfer.py::test_runner_mode_eagle_draft_cuda_graph_runner_cases` | FlashInfer MLA decode kernel in container targets SM9x; on Blackwell falls back to a generic path that doesn't restore metadata buffers under graph replay (~22 abs-diff vs reference) |
 | FlashMLA | MLA `DRAFT_EXTEND` CUDA-graph replay | `[no test]` (`mla/README.md` Next Work) | Capture falls through to `FlashInferMLAAttnBackend.init_forward_metadata_capture_cuda_graph` (1D `cuda_graph_kv_indices`); FlashMLA decode uses 2D `[max_bs, (max_context + PAGE_SIZE) // PAGE_SIZE]` layout — buffer mismatch |
-| GDN / KDA / Lightning / Mamba2 | `DRAFT_EXTEND` and `DRAFT_EXTEND_V2` graph capture | `[no test]` for CG; eager-only paths covered | `HybridLinearAttnBackend` raises `ValueError("Invalid forward mode")` at `hybrid_linear_attn_backend.py:509,572` |
+| GDN / KDA / Lightning / Mamba2 | `DRAFT_EXTEND` and `DRAFT_EXTEND_V2` graph capture | `[no test]` for CG; eager-only paths covered | `HybridLinearAttnBackend` raises `ValueError("Invalid forward mode")` at `hybrid_linear_attn_backend.py:513,702` |
 | DSV4 | EAGLE draft_extend with `compress_ratio != 0` | `[no test]` (runner asserts `case.compress_ratio == 0`) | `DeepseekV4ModelNextN` hardcodes `compress_ratio_override=0`, making C4/C128 draft_extend production-unreachable |
 
 ## C.4. Split-op (PCG / BCG) rejects
@@ -173,7 +172,7 @@ moment production is fixed; no test method invokes them today.
 
 | Backend | Status | Root cause |
 |---|---|---|
-| Lightning | `[no test]` (`lightning/README.md`) | Backend returns flat `[T, num_heads * head_dim]` at `lightning_backend.py:335`; `RadixAttention` piecewise writes per-head (`radix_attention.py:124-137`). Shape mismatch eager vs piecewise |
+| Lightning | `[no test]` (`lightning/README.md`) | Backend returns flat `[T, num_heads * head_dim]` at `lightning_backend.py:447`; `RadixAttention` piecewise writes per-head (`radix_attention.py:219`). Shape mismatch eager vs piecewise |
 | Mamba2 | `[no test]` (`mamba/README.md`) | `MambaMixer2.forward` projects ALL rows of `hidden_states` before per-layer `num_token_non_padded_cpu` slicing (`mamba.py:467`); trips assert under token-padding |
 | DSV4 | `[no test]` (`dsv4/README.md`) | `flash_mla.flash_mla_with_kvcache` asserts `indices.shape == (b, s_q, topk)`; metadata sized for live batch, q is static-token-padded |
 | DSA MHA_ONE_SHOT dense fallback | `[no test]` (`dsa/README.md`) | DSA passes K as concatenated `prefix + extend` to `module.attn(save_kv_cache=False)`; `unified_attention_with_output` (`radix_attention.py:170-208`) slices K to `num_token_non_padded_cpu`, dropping the prefix portion — piecewise CG diverges from eager ~50% mismatch (~0.35 max diff) |
