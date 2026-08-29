@@ -300,8 +300,12 @@ def compressed_attention(
             stride=kernel_stride,
         )
 
-        topk_idx = block_score.topk(topk, dim=-1).indices.sort(-1).values
-        topk_idx = topk_idx.to(torch.int32)
+        topk_idx = (
+            block_score.topk(topk, dim=-1, sorted=False)
+            .indices.to(torch.int32)
+            .sort(-1)
+            .values
+        )
 
     return topk_idx
 
