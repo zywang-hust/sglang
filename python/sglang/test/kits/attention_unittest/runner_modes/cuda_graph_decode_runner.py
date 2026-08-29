@@ -743,6 +743,7 @@ def run_lightning_cuda_graph_decode_case(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
+            topk=1,
         ),
         capture_batch_size=cuda_graph_capture_batch_size,
         max_context_len=max_context_len,

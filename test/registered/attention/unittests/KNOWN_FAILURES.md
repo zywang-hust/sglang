@@ -6,7 +6,7 @@ unit-test suite, **organized by the action needed to address it**.
 
 Anything failing that is not listed here should be treated as a regression.
 
-Last updated: 2026-06-05
+Last updated: 2026-08-30
 
 ## Reference runs
 
@@ -153,7 +153,6 @@ fixture investigation; no test in the suite).
 | FlashMLA | non-EAGLE chain verify | `[no test]` (`mla/README.md`) | Same as FlashInfer MLA (inherits) |
 | FlashInfer SWA | non-EAGLE chain verify | `[no test]` (`swa/README.md`) | `FlashInferIndicesUpdaterPrefill.update_sliding_window` rejects `prefix_lens=None` which non-EAGLE paths supply (`flashinfer_backend.py:742,754,1316`) |
 | KDA | non-EAGLE chain verify | `[no test]` (`kda/test_triton.py`, per-case `atol=0.2` attempted) | 1/384 elements at ~0.11 max diff vs `KDA_ATOL=0.1`; needs kind-specific reference tolerance |
-| Lightning | tree verify (`topk > 1`) | `[no test]` (`lightning/README.md`) | `linear/seg_la.py` has no parent-indices / retrieve-index plumbing |
 | FA3 / FA4 | EAGLE tree verify (`topk = 2`) | `[no test]` (`dense/README.md`) | ~0.16 abs-diff bf16 eager-path drift; kernel-level numerical |
 | DSV4 | tree verify (`topk > 1`) | `[no test]` (`dsv4/README.md`) | `assert self.topk in [0, 1]` at `deepseek_v4_backend.py:369` |
 

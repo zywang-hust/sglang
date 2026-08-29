@@ -545,6 +545,7 @@ def run_lightning_split_op_extend_case(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
+            topk=1,
         ),
         max_context_len=max_context_len,
         dtype=dtype,

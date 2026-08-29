@@ -52,16 +52,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
-        # seg_la processes draft tokens as a chain -- it has no parent-indices
-        # plumbing for tree-shaped drafts, so spec v2 tree verify (topk > 1) would
-        # commit wrong mamba states silently. Fail fast instead of mis-decoding.
-        if self.topk > 1:
-            raise NotImplementedError(
-                "Lightning (seg_la) linear-attention backend does not support "
-                f"speculative decoding with topk > 1 (got topk={self.topk}); "
-                "seg_la verifies a draft tree as a chain. Use "
-                "--speculative-eagle-topk 1."
-            )
         # lightning attn does not need conv cache, but to keep the interface for mamba cache
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
@@ -129,6 +119,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             forward_batch.seq_lens,
         )
         self.forward_metadata.mamba_track_indices = metadata.mamba_track_indices
+        self.forward_metadata.retrieve_next_token = metadata.retrieve_next_token
+        self.forward_metadata.retrieve_next_sibling = metadata.retrieve_next_sibling
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
@@ -143,6 +135,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         self.forward_metadata.track_ssm_final_src = metadata.track_ssm_final_src
         self.forward_metadata.track_ssm_final_dst = metadata.track_ssm_final_dst
         self.forward_metadata.has_mamba_track_mask = metadata.has_mamba_track_mask
+        self.forward_metadata.retrieve_next_token = metadata.retrieve_next_token
+        self.forward_metadata.retrieve_next_sibling = metadata.retrieve_next_sibling
 
     @staticmethod
     def _build_slope_tensor(
@@ -281,6 +275,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         mask=None,
         temp_cache=None,
         intermediate_state_indices=None,
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
         track_lens=None,
         track_state_indices=None,
     ):
@@ -304,6 +300,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             meta=seg_meta,
             caches=temp_cache,
             cache_indices=intermediate_state_indices,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
             track_lens=track_lens,
             track_state_indices=track_state_indices,
             softmax_scale=layer.scaling,
@@ -392,14 +390,15 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 metadata,
             )
         elif self.linear_backend == "seg_la":
+            is_target_verify = forward_batch.forward_mode.is_target_verify()
             intermediate_state_indices = (
                 self.verify_intermediate_state_indices[: cache_indices.shape[0]]
-                if forward_batch.forward_mode.is_target_verify()
+                if is_target_verify
                 else None
             )
             track_lens, track_state_indices = (
                 (None, None)
-                if forward_batch.forward_mode.is_target_verify()
+                if is_target_verify
                 else self._prepare_seg_la_track_store(forward_batch, metadata)
             )
             o = self._linear_attention_entry(
@@ -411,11 +410,15 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 metadata,
                 layer,
                 temp_cache=(
-                    mamba_cache_params.intermediate_ssm
-                    if forward_batch.forward_mode.is_target_verify()
-                    else None
+                    mamba_cache_params.intermediate_ssm if is_target_verify else None
                 ),
                 intermediate_state_indices=intermediate_state_indices,
+                retrieve_next_token=(
+                    metadata.retrieve_next_token if is_target_verify else None
+                ),
+                retrieve_next_sibling=(
+                    metadata.retrieve_next_sibling if is_target_verify else None
+                ),
                 track_lens=track_lens,
                 track_state_indices=track_state_indices,
             )
