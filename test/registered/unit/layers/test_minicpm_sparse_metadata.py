@@ -49,6 +49,95 @@ def _compression_layout():
     )
 
 
+def _single_sparse_row_metadata():
+    return sparse_utils.MiniCPMSparseMetadata(
+        base=SimpleNamespace(
+            page_table=torch.tensor([[10, 0], [20, 21]], dtype=torch.int32),
+        ),
+        sparse_bs_list=[1],
+        sparse_idx=[1],
+        dense_layout=[(0, 0, 0, 1)],
+        sparse_page_table=torch.tensor([[10, 0], [0, 0]], dtype=torch.int32),
+        token_to_bs=torch.tensor([0], dtype=torch.int32),
+        token_pos_in_bs=torch.tensor([2], dtype=torch.int32),
+        seqlen_k_sparse_bs_tensor=torch.tensor([2], dtype=torch.int32),
+    )
+
+
+def _build_fast_path_batch(*, extend_prefix_lens, extend_seq_lens, metadata):
+    q = torch.ones(2, 1)
+    k = torch.ones(2, 1, 1)
+    v = torch.ones(2, 1, 1)
+    layer = SimpleNamespace(
+        is_cross_attention=False,
+        sliding_window_size=-1,
+        tp_q_head_num=1,
+        tp_k_head_num=1,
+        head_dim=1,
+        k_scale=None,
+        v_scale=None,
+    )
+    backend = MiniCPMSparseBackend.__new__(MiniCPMSparseBackend)
+    backend.flash_attn_backend = SimpleNamespace(
+        prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
+        get_paged_mha_kv_cache=Mock(
+            return_value=(torch.ones(4, 1, 1, 1), torch.ones(4, 1, 1, 1))
+        ),
+    )
+    backend.token_to_kv_pool = SimpleNamespace(set_kv_buffer=Mock())
+    backend.attention_adapter = SimpleNamespace(
+        forward=Mock(return_value=torch.ones(2, 1, 1))
+    )
+    backend.forward_metadata = metadata
+    backend.head_group_num = 1
+    backend.heads_per_group = 1
+    backend.block_size = 1
+    backend.block_sparse_prefill_enabled = True
+    backend.num_sparse_topk_tokens = 1
+    backend.get_topk_for_sparse = Mock(
+        return_value=torch.tensor([[[0]]], dtype=torch.int32)
+    )
+    backend._forward_extend_block_sparse = Mock(return_value=torch.ones(2, 1))
+    forward_batch = SimpleNamespace(
+        batch_size=len(extend_prefix_lens),
+        seq_lens_cpu=torch.tensor(
+            [
+                prefix + extend
+                for prefix, extend in zip(extend_prefix_lens, extend_seq_lens)
+            ],
+            dtype=torch.int32,
+        ),
+        extend_seq_lens_cpu=extend_seq_lens,
+        out_cache_loc=torch.tensor([0, 1], dtype=torch.int64),
+        extend_prefix_lens_cpu=extend_prefix_lens,
+        forward_mode=SimpleNamespace(
+            is_draft_extend_v2=lambda: False,
+            is_target_verify=lambda: False,
+        ),
+    )
+    return backend, forward_batch, q, k, v, layer
+
+
+def _fast_path_sparse_metadata():
+    return sparse_utils.MiniCPMSparseMetadata(
+        base=SimpleNamespace(
+            page_table=torch.tensor([[10, 0]], dtype=torch.int32),
+        ),
+        sparse_bs_list=[0],
+        sparse_idx=[0],
+        dense_layout=[],
+        sparse_page_table=torch.zeros((1, 1), dtype=torch.int32),
+        token_to_bs=torch.tensor([0], dtype=torch.int32),
+        token_pos_in_bs=torch.tensor([1], dtype=torch.int32),
+        seqlen_k_sparse_bs_tensor=torch.tensor([2], dtype=torch.int32),
+    )
+
+
+class _FakeMiniCPMFlashInferAdapter:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
 def _construct_sparse_backend(
     *,
     max_context_len=256,
@@ -56,6 +145,7 @@ def _construct_sparse_backend(
     max_running_requests=1,
     use_flashinfer=False,
     blackwell=False,
+    kv_cache_dtype_str="bfloat16",
 ):
     req_pool = SimpleNamespace(
         req_to_sparse_k1_token=torch.empty(0),
@@ -68,6 +158,7 @@ def _construct_sparse_backend(
         req_to_token_pool=req_pool,
         token_to_kv_pool=SimpleNamespace(),
         page_size=1,
+        kv_cache_dtype_str=kv_cache_dtype_str,
     )
     model_runner = SimpleNamespace(
         dtype=torch.float16,
@@ -106,7 +197,7 @@ def _construct_sparse_backend(
         patch.object(
             backend_module,
             "MiniCPMFlashInferAdapter",
-            return_value=object(),
+            _FakeMiniCPMFlashInferAdapter,
         ),
         patch.object(
             backend_module,
@@ -279,7 +370,11 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         self.assertEqual(backend.fused_kernel_kwargs["kernel_stride"], 16)
 
         model_runner.server_args.attention_backend = "minicpm_flashinfer"
-        flashinfer_adapter = object()
+
+        class _StubFlashInferAdapter:
+            def __init__(self, *args, **kwargs):
+                pass
+
         fake_fuse_kernel = ModuleType("sglang.srt.layers.attention.minicpm.fuse_kernel")
         fake_fuse_kernel.fused_attn_pooling_online_topk_prefill = Mock(
             return_value="prefill"
@@ -302,7 +397,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             patch.object(
                 backend_module,
                 "MiniCPMFlashInferAdapter",
-                return_value=flashinfer_adapter,
+                _StubFlashInferAdapter,
             ),
             patch.object(
                 backend_module,
@@ -314,7 +409,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             backend = MiniCPMSparseBackend(model_runner, use_flashinfer=True)
 
         self.assertIs(backend.flash_attn_backend, flash_attn_backend)
-        self.assertIs(backend.attention_adapter, flashinfer_adapter)
+        self.assertIsInstance(backend.attention_adapter, _StubFlashInferAdapter)
 
         model_config.num_attention_heads = 8
         with (
@@ -353,6 +448,25 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             self.assertRaisesRegex(ValueError, "16 query heads per KV head"),
         ):
             MiniCPMSparseBackend(model_runner, use_flashinfer=False)
+
+    def test_block_sparse_prefill_flag_follows_adapter_and_kv_dtype(self):
+        """The q-tiled fast path carries no descale,
+        so with an auto kv-cache dtype,
+        its flag must derive only for the flashinfer adapter."""
+        backend, *_ = _construct_sparse_backend(
+            use_flashinfer=True, kv_cache_dtype_str="bfloat16"
+        )
+        self.assertFalse(backend.block_sparse_prefill_enabled)
+
+        backend, *_ = _construct_sparse_backend(
+            use_flashinfer=True, kv_cache_dtype_str="auto"
+        )
+        self.assertTrue(backend.block_sparse_prefill_enabled)
+
+        backend, *_ = _construct_sparse_backend(
+            use_flashinfer=False, kv_cache_dtype_str="auto"
+        )
+        self.assertFalse(backend.block_sparse_prefill_enabled)
 
     def test_dense_as_sparse_routes_short_prefill(self):
         req_pool = SimpleNamespace(
@@ -651,6 +765,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend.head_group_num = 1
         backend.heads_per_group = 1
         backend.block_size = 1
+        backend.block_sparse_prefill_enabled = False
         backend.num_sparse_topk_tokens = 1
         backend.get_topk_for_sparse = Mock(
             return_value=torch.tensor([[[0]]], dtype=torch.int32)
@@ -687,6 +802,79 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         self.assertEqual(
             backend.forward_metadata.sparse_page_table.tolist(),
             [[10, 0], [21, 0]],
+        )
+
+    def test_block_sparse_fast_path_serves_capacity_covering_prefix(self):
+        """A prefix covering the sparse row capacity takes the fast path."""
+        metadata = _fast_path_sparse_metadata()
+        backend, forward_batch, q, k, v, layer = _build_fast_path_batch(
+            extend_prefix_lens=[1], extend_seq_lens=[2], metadata=metadata
+        )
+        result = backend.forward_extend(q, k, v, layer, forward_batch)
+        backend._forward_extend_block_sparse.assert_called_once()
+        kwargs = backend._forward_extend_block_sparse.call_args.kwargs
+        self.assertTrue(
+            torch.equal(
+                kwargs["q"],
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            )
+        )
+        self.assertEqual((kwargs["prefix_len"], kwargs["seq_len"]), (1, 3))
+        self.assertTrue(torch.equal(kwargs["page_table"], metadata.base.page_table[0]))
+        self.assertIs(kwargs["topk_idx"], backend.get_topk_for_sparse.return_value)
+        self.assertIs(result, backend._forward_extend_block_sparse.return_value)
+
+    def _assert_staged_extend_page_table(self, builder_args, expected_table):
+        """The staged extend page-table check,
+        shared by the block-sparse fast-path tests."""
+        backend, forward_batch, q, k, v, layer = builder_args
+        with patch.object(
+            backend_module,
+            "get_block_table",
+            return_value=torch.tensor([[21]], dtype=torch.int32),
+        ):
+            backend.forward_extend(q, k, v, layer, forward_batch)
+        backend._forward_extend_block_sparse.assert_not_called()
+        self.assertEqual(
+            backend.forward_metadata.sparse_page_table.tolist(),
+            expected_table,
+        )
+
+    def test_block_sparse_fast_path_stages_second_request(self):
+        """A second request keeps the batch on the staged path."""
+        two_request = _single_sparse_row_metadata()
+        builder_args = _build_fast_path_batch(
+            extend_prefix_lens=[1, 1], extend_seq_lens=[1, 1], metadata=two_request
+        )
+        self._assert_staged_extend_page_table(
+            builder_args=builder_args,
+            expected_table=[[10, 0], [21, 0]],
+        )
+
+    def test_block_sparse_fast_path_stages_short_prefix(self):
+        """A prefix below the sparse row capacity keeps the staged path."""
+        builder_args = _build_fast_path_batch(
+            extend_prefix_lens=[0],
+            extend_seq_lens=[2],
+            metadata=_fast_path_sparse_metadata(),
+        )
+        self._assert_staged_extend_page_table(
+            builder_args=builder_args,
+            expected_table=[[21]],
+        )
+
+    def test_block_sparse_fast_path_stages_with_flag_off(self):
+        """A disabled config flag keeps the staged path."""
+        builder_args = _build_fast_path_batch(
+            extend_prefix_lens=[1],
+            extend_seq_lens=[2],
+            metadata=_fast_path_sparse_metadata(),
+        )
+        backend = builder_args[0]
+        backend.block_sparse_prefill_enabled = False
+        self._assert_staged_extend_page_table(
+            builder_args=builder_args,
+            expected_table=[[21]],
         )
 
     def test_dense_decode_copies_full_page_table(self):

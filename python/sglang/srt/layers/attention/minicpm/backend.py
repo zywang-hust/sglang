@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.minicpm.attention_adapter import (
     MiniCPMFlashAttentionAdapter,
     MiniCPMFlashInferAdapter,
 )
+from sglang.srt.layers.attention.minicpm.block_sparse_attention import (
+    block_sparse_attention,
+)
 from sglang.srt.layers.attention.minicpm.cache import attach_compressed_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
@@ -202,6 +205,8 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.local_blocks = self.window_size // self.block_size  # local_blocks
         self.sparse_topk = topk + (self.window_size // self.block_size)
         self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
+        # num_sparse_topk_tokens is the sparse row capacity
+        # (sparse_capacity in the planning helpers).
         required_context_len = max(self.config_dense_len, self.num_sparse_topk_tokens)
         if self.max_context_len < required_context_len:
             raise ValueError(
@@ -301,6 +306,15 @@ class MiniCPMSparseBackend(AttentionBackend):
             )
             if use_flashinfer
             else MiniCPMFlashAttentionAdapter(self.flash_attn_backend)
+        )
+        self._init_block_sparse_prefill_gate()
+
+    def _init_block_sparse_prefill_gate(self):
+        # The fast path's triton kernel reads the raw KV buffer with no descale,
+        # so only dtype "auto" (bf16 on SALA) is safe; others take the descale adapter.
+        self.block_sparse_prefill_enabled = (
+            isinstance(self.attention_adapter, MiniCPMFlashInferAdapter)
+            and self.flash_attn_backend.kv_cache_dtype_str == "auto"
         )
 
     def _get_fused_topk_kernel(self, batch_size: int, *, is_prefill: bool):
@@ -664,42 +678,14 @@ class MiniCPMSparseBackend(AttentionBackend):
                 is_prefill=True,
             )
         )
-        page_table = metadata.base.page_table
 
-        if metadata.sparse_bs_list:
-            q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-            topk_idx = self.get_topk_for_sparse(
-                query_states=q_reshaped,
-                key_states=k,
-                layer=layer,
-                forward_batch=forward_batch,
-            )
-
-            sparse_page_table_sparse_bs = get_block_table(
-                topk_idx,
-                page_table[metadata.sparse_bs_list],
-                metadata.token_to_bs,
-                metadata.token_pos_in_bs,
-                metadata.seqlen_k_sparse_bs_tensor,
-                head_group_num=self.head_group_num,
-                block_size=self.block_size,
-                elementwise=False,
-            ).reshape(-1, self.num_sparse_topk_tokens)
-
-            # copy page table for sparse bs
-            metadata.sparse_page_table[
-                metadata.sparse_idx, : self.num_sparse_topk_tokens
-            ] = sparse_page_table_sparse_bs
-        else:
-            total_k1 = self.forward_metadata.k1.cu_seqlens_cpu[-1]
-            total_k2 = self.forward_metadata.k2.cu_seqlens_cpu[-1]
-
+        if not metadata.sparse_bs_list:
             allocate_and_compress_keys(
                 layer=layer,
                 forward_batch=forward_batch,
-                metadata=self.forward_metadata,
-                k1_token_nums=total_k1,
-                k2_token_nums=total_k2,
+                metadata=metadata,
+                k1_token_nums=metadata.k1.cu_seqlens_cpu[-1],
+                k2_token_nums=metadata.k2.cu_seqlens_cpu[-1],
                 k1_kernel_size=self.k1_kernel_size,
                 k1_kernel_stride=self.k1_kernel_stride,
                 k2_kernel_size=self.k2_kernel_size,
@@ -708,6 +694,31 @@ class MiniCPMSparseBackend(AttentionBackend):
                 device=k.device,
                 max_context_length=self.max_context_len,
             )
+        else:
+            q_rows = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            topk_idx = self.get_topk_for_sparse(
+                query_states=q_rows,
+                key_states=k,
+                layer=layer,
+                forward_batch=forward_batch,
+            )
+            # The prefix bound keeps each chunk token past the _get_sparse_cache_lens
+            # clamp; the staged path plans below-capacity rows.
+            if (
+                self.block_sparse_prefill_enabled
+                and forward_batch.batch_size == 1
+                and forward_batch.extend_prefix_lens_cpu[0]
+                >= self.num_sparse_topk_tokens
+            ):
+                return self._forward_extend_block_sparse(
+                    q=q_rows,
+                    layer=layer,
+                    page_table=metadata.base.page_table[0],
+                    topk_idx=topk_idx,
+                    prefix_len=forward_batch.extend_prefix_lens_cpu[0],
+                    seq_len=int(forward_batch.seq_lens_cpu[0]),
+                )
+            self._write_prefill_sparse_rows(topk_idx=topk_idx, metadata=metadata)
 
         dense_layout_spans = [
             (query_start, query_len)
@@ -749,6 +760,54 @@ class MiniCPMSparseBackend(AttentionBackend):
         )
 
         return result.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _write_prefill_sparse_rows(
+        self, *, topk_idx: torch.Tensor, metadata: MiniCPMSparseMetadata
+    ) -> None:
+        sparse_page_table_sparse_bs = get_block_table(
+            topk_idx,
+            metadata.base.page_table[metadata.sparse_bs_list],
+            metadata.token_to_bs,
+            metadata.token_pos_in_bs,
+            metadata.seqlen_k_sparse_bs_tensor,
+            head_group_num=self.head_group_num,
+            block_size=self.block_size,
+            elementwise=False,
+        ).reshape(-1, self.num_sparse_topk_tokens)
+
+        metadata.sparse_page_table[
+            metadata.sparse_idx, : self.num_sparse_topk_tokens
+        ] = sparse_page_table_sparse_bs
+
+    def _forward_extend_block_sparse(
+        self,
+        *,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        page_table: torch.Tensor,
+        topk_idx: torch.Tensor,
+        prefix_len: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        # The flat views below read the raw NHD pool buffer directly,
+        # and the kernel tolerates -1 padding rows.
+        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        assert key_cache.shape[1:] == (
+            layer.tp_k_head_num,
+            layer.head_dim,
+        ), key_cache.shape
+        result = block_sparse_attention(
+            q=q,
+            k_cache=key_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
+            v_cache=value_cache.view(-1, layer.tp_v_head_num, layer.head_dim),
+            page_table=page_table,
+            topk_idx=topk_idx,
+            prefix_len=prefix_len,
+            seq_len=seq_len,
+            block_size=self.block_size,
+            softmax_scale=layer.scaling,
+        )
+        return result.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -846,7 +905,6 @@ class MiniCPMSparseBackend(AttentionBackend):
         q_reshaped_by_head_group = q_reshaped.reshape(
             -1, self.heads_per_group, layer.head_dim
         )
-        assert self.page_size == 1
         result = self.attention_adapter.forward(
             q_reshaped_by_head_group,
             key_cache,
