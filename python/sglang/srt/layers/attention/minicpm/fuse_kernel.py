@@ -5,8 +5,9 @@ import tilelang
 import tilelang.language as T
 import tilelang.math
 
+# TL_DISABLE_THREAD_STORAGE_SYNC must stay off: the per-round shared-memory
+# bitonic sort relies on the __syncthreads() the pass inserts.
 _pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
