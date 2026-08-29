@@ -227,6 +227,30 @@ def test_prefill_topk_subscribed_rows_select_only_causal_blocks():
     assert ((topk_idx <= own) | (topk_idx < 0)).all()
 
 
+@pytest.mark.parametrize("seq_len", [6500, 8500, 12000])
+def test_decode_topk_keeps_forced_blocks_beyond_output_topk(seq_len):
+    """+inf-forced init/local blocks must survive truncation from kernel_topk
+    to output_topk when more than output_topk blocks are selectable.
+    """
+    q, k, cu_seqlens_q, cu_seqlens_k, cache_lens = _make_decode_inputs(seq_len)
+    kernel = _kernel(fused_attn_pooling_online_topk_decode)
+    topk_idx = _run_topk(kernel, q, k, cu_seqlens_q, cu_seqlens_k, cache_lens)
+
+    num_blocks = (seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+    last_block = (seq_len - 1) // _BLOCK_SIZE
+    sel = topk_idx[:, 0]
+    assert (sel < num_blocks).all()
+    ordered = sel.sort(-1).values
+    assert not ((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()
+    forced = torch.cat(
+        [
+            torch.arange(_INIT_BLOCKS, device="cuda"),
+            torch.arange(last_block - _LOCAL_BLOCKS, last_block + 1, device="cuda"),
+        ]
+    )
+    assert (sel[:, None, :] == forced[None, :, None]).any(-1).all()
+
+
 if __name__ == "__main__":
     import sys
 
