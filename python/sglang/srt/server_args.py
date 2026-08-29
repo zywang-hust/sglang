@@ -237,6 +237,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "fa4",
     "flashinfer",
     "intel_xpu",
+    "minicpm_flashinfer",
     "triton",
 ]
 add_deterministic_attention_backend_choices = (

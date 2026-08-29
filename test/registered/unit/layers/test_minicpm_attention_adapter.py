@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 with patch.dict(
     sys.modules,
@@ -47,7 +48,25 @@ def _metadata(rows=1):
     )
 
 
-class TestMiniCPMAttentionAdapter(unittest.TestCase):
+def _adapter_stub(num_qo_heads, head_dim):
+    adapter = MiniCPMFlashInferAdapter.__new__(MiniCPMFlashInferAdapter)
+    adapter.device = torch.device("cpu")
+    adapter.head_group_num = 2
+    adapter.num_qo_heads = num_qo_heads
+    adapter.num_kv_heads = 1
+    adapter.head_dim = head_dim
+    adapter.page_size = 1
+    adapter.max_kv_tokens_per_row = 4
+    adapter.q_dtype = torch.float16
+    adapter.kv_dtype = torch.float16
+    adapter.kv_indptr = torch.zeros(3, dtype=torch.int32)
+    adapter.kv_indices = torch.zeros(8, dtype=torch.int32)
+    adapter.kv_last_page_len = torch.ones(2, dtype=torch.int32)
+    adapter.rows = torch.arange(2, dtype=torch.int32)
+    return adapter
+
+
+class TestMiniCPMAttentionAdapter(CustomTestCase):
     def test_flashattention_adapter_owns_kernel_arguments(self):
         expected = torch.ones(1, 1, 1)
         flash_attn_backend = SimpleNamespace(
@@ -146,6 +165,7 @@ class TestMiniCPMAttentionAdapter(unittest.TestCase):
         wrapper = SimpleNamespace(begin_forward=Mock())
         adapter.flashinfer_backend = SimpleNamespace(
             get_cuda_graph_decode_wrappers=Mock(return_value=[wrapper]),
+            disable_cuda_graph_kv_split=False,
         )
         metadata = _metadata(rows=2)
 
@@ -162,9 +182,53 @@ class TestMiniCPMAttentionAdapter(unittest.TestCase):
         wrapper.begin_forward.assert_called_once()
         self.assertIs(adapter.active_wrapper, wrapper)
 
+    def test_flashinfer_plan_pins_deterministic_split_schedule(self):
+        """Regression: every plan call must forward the backend's deterministic
+        split pinning, or decode row counts change the split-KV chunk order."""
+        adapter = _adapter_stub(num_qo_heads=16, head_dim=128)
+        decode_wrapper = SimpleNamespace(begin_forward=Mock())
+        graph_wrapper = SimpleNamespace(begin_forward=Mock())
+        prefill_wrapper = SimpleNamespace(begin_forward=Mock())
+        adapter.flashinfer_backend = SimpleNamespace(
+            decode_wrappers=[decode_wrapper],
+            prefill_wrappers_paged=[prefill_wrapper],
+            get_cuda_graph_decode_wrappers=Mock(return_value=[graph_wrapper]),
+            decode_split_tile_size=2048,
+            prefill_split_tile_size=4096,
+            disable_cuda_graph_kv_split=True,
+        )
+        metadata = _metadata(rows=2)
+
+        adapter._prepare(metadata, is_prefill=False, graph=False)
+        kwargs = decode_wrapper.begin_forward.call_args.kwargs
+        self.assertEqual(kwargs["fixed_split_size"], 2048)
+        self.assertFalse(kwargs["disable_split_kv"])
+
+        adapter._prepare(metadata, is_prefill=False, graph=True)
+        kwargs = graph_wrapper.begin_forward.call_args.kwargs
+        self.assertIsNone(kwargs["fixed_split_size"])
+        self.assertTrue(kwargs["disable_split_kv"])
+
+        adapter._prepare(metadata, is_prefill=True)
+        kwargs = prefill_wrapper.begin_forward.call_args.kwargs
+        self.assertEqual(kwargs["fixed_split_size"], 4096)
+
+        # Without the deterministic pin,
+        # the graph path must leave the split-KV schedule at flashinfer's default,
+        # instead of forcing it.
+        adapter.flashinfer_backend.disable_cuda_graph_kv_split = False
+        adapter._prepare(metadata, is_prefill=False, graph=True)
+        kwargs = graph_wrapper.begin_forward.call_args.kwargs
+        self.assertIsNone(kwargs["fixed_split_size"])
+        self.assertFalse(kwargs["disable_split_kv"])
+
     def test_flashinfer_decode_indices_cover_dense_rows(self):
         wrapper = SimpleNamespace(begin_forward=Mock())
-        flashinfer_backend = SimpleNamespace(decode_wrappers=[wrapper])
+        flashinfer_backend = SimpleNamespace(
+            decode_wrappers=[wrapper],
+            decode_split_tile_size=None,
+            disable_cuda_graph_kv_split=False,
+        )
         flashinfer_backend_module = ModuleType(
             "sglang.srt.layers.attention.flashinfer_backend"
         )

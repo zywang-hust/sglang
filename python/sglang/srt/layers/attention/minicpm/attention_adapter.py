@@ -200,6 +200,7 @@ class MiniCPMFlashInferAdapter:
                 q_data_type=self.q_dtype,
                 kv_data_type=self.kv_dtype,
                 non_blocking=True,
+                fixed_split_size=self.flashinfer_backend.prefill_split_tile_size,
             )
         else:
             kv_indptr = self.kv_indptr[: sparse_bs + 1]
@@ -229,6 +230,14 @@ class MiniCPMFlashInferAdapter:
                 q_data_type=self.q_dtype,
                 kv_data_type=self.kv_dtype,
                 non_blocking=True,
+                fixed_split_size=(
+                    None if graph else self.flashinfer_backend.decode_split_tile_size
+                ),
+                disable_split_kv=(
+                    self.flashinfer_backend.disable_cuda_graph_kv_split
+                    if graph
+                    else False
+                ),
             )
 
         self.active_wrapper = wrapper
