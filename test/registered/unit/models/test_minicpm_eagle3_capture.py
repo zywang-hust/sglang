@@ -35,7 +35,9 @@ class _RecordingLayer:
         self.delta = delta
 
     def __call__(self, positions, hidden_states, forward_batch, residual):
-        return hidden_states + self.delta, None
+        if residual is None:
+            residual = torch.zeros_like(hidden_states)
+        return hidden_states + self.delta, residual + self.delta
 
 
 def _bare_model(layers_to_capture) -> MiniCPMModel:
@@ -45,7 +47,7 @@ def _bare_model(layers_to_capture) -> MiniCPMModel:
         input_ids.shape[0], _HIDDEN, dtype=torch.float32
     )
     model.layers = [_RecordingLayer(delta=float(i + 1)) for i in range(_NUM_LAYERS)]
-    model.norm = lambda hidden_states: hidden_states
+    model.norm = lambda hidden_states, residual: (hidden_states + residual, None)
     model.layers_to_capture = layers_to_capture
     return model
 
@@ -72,7 +74,7 @@ class TestEagle3LayerMapping(CustomTestCase):
 
 
 class TestAuxCaptureForward(CustomTestCase):
-    def test_capture_reads_previous_layer_output(self):
+    def test_capture_materializes_full_residual_stream(self):
         model = _bare_model(layers_to_capture=[1, 2])
         input_ids = torch.zeros(3, dtype=torch.int64)
 
@@ -80,12 +82,13 @@ class TestAuxCaptureForward(CustomTestCase):
             input_ids, positions=None, forward_batch=None
         )
 
-        # Layer deltas are 1, 2, 3, ...; the stream before layer i is
-        # sum(1..i).
+        # Each half of the split stream before layer i is sum(1..i),
+        # so aux[i] = 2 * sum(1..i).
         self.assertEqual(len(aux), 2)
-        self.assertTrue(torch.equal(aux[0], torch.full((3, _HIDDEN), 1.0)))
-        self.assertTrue(torch.equal(aux[1], torch.full((3, _HIDDEN), 1.0 + 2.0)))
-        self.assertTrue(torch.equal(hidden_states, torch.full((3, _HIDDEN), 36.0)))
+        self.assertTrue(torch.equal(aux[0], torch.full((3, _HIDDEN), 2.0)))
+        self.assertTrue(torch.equal(aux[1], torch.full((3, _HIDDEN), 6.0)))
+        # The final norm folds hidden + residual: 2 * sum(1..8) = 72.
+        self.assertTrue(torch.equal(hidden_states, torch.full((3, _HIDDEN), 72.0)))
 
     def test_no_capture_returns_plain_tensor(self):
         # Runners unpack a tuple only when capture_aux_hidden_states is set.
