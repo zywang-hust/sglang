@@ -982,6 +982,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend.k1_kernel_stride = 16
         backend.k2_kernel_size = 128
         backend.k2_kernel_stride = 64
+        backend.speculative_num_draft_tokens = None
 
         backend.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
 
@@ -1252,6 +1253,7 @@ import sglang.srt.layers.attention.minicpm.backend
     def test_mixed_prefill_compiles_fused_topk_for_sparse_batch_only(self):
         """A mixed batch must compile fused top-k for its sparse sub-batch only."""
         backend = MiniCPMSparseBackend.__new__(MiniCPMSparseBackend)
+        backend._use_cuda_graph_buffers = False
         backend.forward_metadata = SimpleNamespace(
             sparse_bs_list=[1],
             base=SimpleNamespace(

@@ -455,12 +455,16 @@ class MiniCPMSparseMetadata(msgspec.Struct):
     token_pos_in_bs: Optional[torch.Tensor] = None
     # Head-group-interleaved block table for the sparse rows.
     sparse_page_table: Optional[torch.Tensor] = None
+    # Chain-verify dense-row overwrite (_build_dense_verify_overwrite): prefix pages
+    # and the sparse_page_table entries they replace; the verify graphs bind it static.
+    verify_dense_rows: Optional[torch.Tensor] = None
+    verify_dense_mask: Optional[torch.Tensor] = None
     # Varlen geometry of the sparse row attention (decode or verify rows).
     sparse_cache_seqlens_int32: Optional[torch.Tensor] = None
     sparse_cu_seqlens_q: Optional[torch.Tensor] = None
     sparse_cu_seqlens_k: Optional[torch.Tensor] = None
     sparse_max_seq_len_q: int = 1
-    # Stage-1 cache lengths excluding the current token (decode topk gate).
+    # Stage-1 cache lengths excluding the current token (decode/verify topk gate).
     cache_seqlens_int32_stage1: Optional[torch.Tensor] = None
     # Stage-1 query geometry expanded to one row per (token, head group).
     cu_seqlens_q_adjusted: Optional[torch.Tensor] = None
@@ -635,6 +639,70 @@ def _plan_dense_rows(
     ]
 
 
+def _build_sparse_verify_replay_rows(
+    seq_lens: torch.Tensor,
+    head_group_num: int,
+    dense_len: int,
+    sparse_topk: int,
+    block_size: int,
+    num_draft_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device closed form of ``_plan_sparse_verify``'s chain row lengths,
+    sync-free for graph replay.
+
+    Returns ``(token_pos, row_lens)``: causal positions
+    ``(bs * num_draft_tokens,)`` and per-(token, head group) row lengths
+    ``(bs * num_draft_tokens * head_group_num,)``.
+    """
+    device = seq_lens.device
+    sparse_capacity = sparse_topk * block_size
+    offsets = torch.arange(1, num_draft_tokens + 1, dtype=torch.int32, device=device)
+    token_pos = seq_lens.to(torch.int32).repeat_interleave(
+        num_draft_tokens
+    ) + offsets.repeat(seq_lens.numel())
+    row_lens = torch.where(
+        token_pos < dense_len,
+        token_pos,
+        _get_sparse_cache_lens(token_pos, sparse_capacity, block_size),
+    )
+    # token_pos: (bs * num_draft_tokens,) causal positions;
+    # row_lens: one entry per (token, head group), dense rows keep p, others clamp.
+    return token_pos, row_lens.repeat_interleave(head_group_num)
+
+
+def _build_dense_verify_overwrite(
+    token_pos: torch.Tensor,
+    token_to_bs: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    dense_len: int,
+    head_group_num: int,
+    out_rows: Optional[torch.Tensor] = None,
+    out_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Eager base.page_table can be narrower than dense_len; graph tables are
+    # max_context_len wide, so the clamp is an identity there.
+    num_cols = min(dense_len, page_table.shape[1])
+    dense_src = torch.index_select(page_table[:, :num_cols], 0, token_to_bs)
+    group_offsets = torch.arange(
+        head_group_num, dtype=dense_src.dtype, device=page_table.device
+    )
+    cols = torch.arange(num_cols, device=page_table.device)
+    # Rows at token positions past dense_len get a zero column limit,
+    # folding the row gate into the column comparison.
+    col_limits = torch.where(token_pos < dense_len, token_pos, 0)
+    # Group-interleaved prefix pages plus the mask of entries they replace,
+    # in the layout _copy_dense_page_table writes.
+    rows = torch.add(
+        group_offsets[None, :, None],
+        dense_src[:, None, :],
+        alpha=head_group_num,
+        out=out_rows,
+    )
+    mask = torch.lt(cols[None, None, :], col_limits[:, None, None], out=out_mask)
+    return rows, mask
+
+
 def _plan_sparse_prefill(
     forward_batch: ForwardBatch,
     metadata: MiniCPMSparseMetadata,
@@ -769,6 +837,27 @@ def _plan_repeated_segments(
     return RepeatedSegmentLayout(index=index, cu_seqlens=out_cu_seqlens)
 
 
+def _plan_uniform_slab_segments(
+    batch_size: int,
+    *,
+    segment_rows: int,
+    repeats: int,
+    device: torch.device,
+) -> RepeatedSegmentLayout:
+    # Uniform segment_rows per request; unwritten slab rows are -inf filled at replay.
+    index = (
+        torch.arange(batch_size * segment_rows, dtype=torch.int64, device=device)
+        .view(batch_size, segment_rows)
+        .repeat_interleave(repeats, dim=0)
+        .reshape(-1)
+    )
+    cu_seqlens = (
+        torch.arange(batch_size * repeats + 1, dtype=torch.int32, device=device)
+        * segment_rows
+    )
+    return RepeatedSegmentLayout(index=index, cu_seqlens=cu_seqlens)
+
+
 def _plan_sparse_verify(
     forward_batch: ForwardBatch,
     metadata: MiniCPMSparseMetadata,
@@ -816,7 +905,6 @@ def _plan_sparse_verify(
     )
 
     row_lens_cpu = torch.empty((rows,), dtype=torch.int32, device="cpu")
-    dense_rows = []
     for batch_idx in range(bs):
         prefix_len = int(forward_batch.seq_lens_cpu[batch_idx])
         for draft_idx in range(num_draft_tokens):
@@ -824,13 +912,22 @@ def _plan_sparse_verify(
             row_start = (batch_idx * num_draft_tokens + draft_idx) * head_group_num
             if token_pos < dense_len:
                 row_len = token_pos
-                dense_rows.append((row_start, batch_idx, token_pos))
             else:
                 row_len = _get_sparse_cache_len(token_pos, sparse_capacity, block_size)
             row_lens_cpu[row_start : row_start + head_group_num] = row_len
 
     sparse_cache_seqlens_int32 = row_lens_cpu.to(device=device)
-    metadata.dense_rows = dense_rows
+    metadata.verify_dense_rows, metadata.verify_dense_mask = (
+        _build_dense_verify_overwrite(
+            token_pos_in_bs,
+            token_to_bs,
+            base_metadata.page_table,
+            dense_len=dense_len,
+            head_group_num=head_group_num,
+        )
+    )
+    # The selection fill must write exactly these row lengths, row for row;
+    # the FlashInfer plan consumes them.
     _assign_row_metadata(
         metadata,
         sparse_cache_seqlens_int32=sparse_cache_seqlens_int32,

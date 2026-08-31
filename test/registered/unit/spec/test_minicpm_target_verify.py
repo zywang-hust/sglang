@@ -15,12 +15,16 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.attention.minicpm import backend as backend_module
+from sglang.srt.layers.attention.minicpm.backend import _copy_dense_page_table
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     MiniCPMSparseMetadata,
+    _build_dense_verify_overwrite,
     _build_sparse_decode_metadata,
+    _build_sparse_verify_replay_rows,
     _get_sparse_cache_len,
     _plan_repeated_segments,
     _plan_sparse_verify,
+    _plan_uniform_slab_segments,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -176,13 +180,63 @@ class TestPlanRepeatedSegments(CustomTestCase):
         want = torch.cat([flat[0:2]] * 3 + [flat[2:5]] * 3)
         self.assertTrue(torch.equal(flat.index_select(0, layout.index), want))
 
+    def test_uniform_slab_repeat_matches_packed_repeat(self):
+        """Uniform-slab repeat must match the packed repeat on every live prefix,
+        with padding past a request's chunks staying -inf."""
+        segment_rows, num_draft_tokens = 8, 3
+        chunk_lens = [3, 8, 0, 5]
+        bs = len(chunk_lens)
+        slab = torch.full((bs * segment_rows, 1, 2), float("-inf"))
+        packed_segments = []
+        for batch_idx, n in enumerate(chunk_lens):
+            segment = (
+                torch.arange(n * 2, dtype=torch.float32).view(n, 1, 2) + 100 * batch_idx
+            )
+            slab[batch_idx * segment_rows : batch_idx * segment_rows + n] = segment
+            packed_segments.append(segment)
+        flat = torch.cat(packed_segments)
+        packed_cu = [0]
+        for n in chunk_lens:
+            packed_cu.append(packed_cu[-1] + n)
 
-def _make_backend(num_draft_tokens, eagle_topk):
+        eager_layout = _plan_repeated_segments(
+            torch.tensor(packed_cu, dtype=torch.int32),
+            total_tokens=packed_cu[-1],
+            repeats=num_draft_tokens,
+        )
+        eager_rep = flat.index_select(0, eager_layout.index)
+        layout = _plan_uniform_slab_segments(
+            batch_size=bs,
+            segment_rows=segment_rows,
+            repeats=num_draft_tokens,
+            device="cpu",
+        )
+        rep = slab.index_select(0, layout.index)
+
+        self.assertTrue(
+            torch.equal(
+                layout.cu_seqlens,
+                torch.arange(bs * num_draft_tokens + 1, dtype=torch.int32)
+                * segment_rows,
+            )
+        )
+        for row in range(bs * num_draft_tokens):
+            n = chunk_lens[row // num_draft_tokens]
+            live = rep[row * segment_rows : row * segment_rows + n]
+            start = int(eager_layout.cu_seqlens[row])
+            eager_live = eager_rep[start : start + n]
+            self.assertTrue(torch.equal(live, eager_live), row)
+            padding = rep[row * segment_rows + n : (row + 1) * segment_rows]
+            self.assertTrue(torch.isinf(padding).all(), row)
+
+
+def _make_backend(num_draft_tokens, eagle_topk, num_kv_heads=1):
     backend, flash_attn_backend = make_sparse_backend(
         server_args_overrides={
             "speculative_num_draft_tokens": num_draft_tokens,
             "speculative_eagle_topk": eagle_topk,
-        }
+        },
+        num_kv_heads=num_kv_heads,
     )
     backend.attention_adapter = Mock()
     return backend, flash_attn_backend
@@ -252,8 +306,9 @@ class TestBackendVerifyMetadata(CustomTestCase):
                 _get_sparse_cache_len(202, 128, 64),
             ],
         )
-        self.assertEqual(metadata.dense_rows, [(0, 0, 4), (1, 0, 5)])
-        self.assertEqual(metadata.topk_max_seqlen_q, 1)
+        self.assertEqual(
+            metadata.verify_dense_mask[:, 0, :].sum(dim=1).tolist(), [4, 5, 0, 0]
+        )
         self.assertEqual(metadata.max_seqlen_q_adjusted, backend.heads_per_group)
 
         prepare_kwargs = backend.attention_adapter.prepare_forward.call_args.kwargs
@@ -270,6 +325,451 @@ class TestBackendVerifyMetadata(CustomTestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, "draft extend"):
             backend.init_forward_metadata(forward_batch)
+
+
+def _graph_backend(num_draft_tokens, max_bs, num_kv_heads=1, pool_size=8):
+    """Backend with CUDA-graph buffers sized for max_bs verify requests."""
+    backend, flash_attn_backend = _make_backend(
+        num_draft_tokens, eagle_topk=1, num_kv_heads=num_kv_heads
+    )
+    backend.init_cuda_graph_state(max_bs, max_bs * num_draft_tokens)
+    for name in ("k1", "k2"):
+        pages = backend.decode_cuda_graph_metadata[f"{name}.table"].shape[1]
+        table = torch.arange(pool_size * pages, dtype=torch.int32).view(
+            pool_size, pages
+        )
+        setattr(backend, f"req_to_sparse_{name}_token", table)
+    return backend, flash_attn_backend
+
+
+def _graph_base(padded_seq_lens, num_draft_tokens, max_pages=1024):
+    """Static base buffers as the FlashAttention verify replay leaves them."""
+    seq_lens = torch.tensor(padded_seq_lens, dtype=torch.int32)
+    cache_seqlens = seq_lens + num_draft_tokens
+    bs = len(padded_seq_lens)
+    return SimpleNamespace(
+        cache_seqlens_int32=cache_seqlens,
+        max_seq_len_q=num_draft_tokens,
+        max_seq_len_k=int(cache_seqlens.max()),
+        cu_seqlens_q=torch.arange(
+            0, bs * num_draft_tokens + 1, num_draft_tokens, dtype=torch.int32
+        ),
+        cu_seqlens_k=F.pad(
+            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+        ),
+        page_table=torch.zeros((bs, max_pages), dtype=torch.int32),
+    )
+
+
+class TestVerifyGraphTwoState(CustomTestCase):
+    def test_capture_binds_retained_repeat_layouts(self):
+        """Regression: the captured selection gathers through the repeat
+        layout's index, so the graph records that tensor's device address.
+        Binding must hand out prefix views of the layouts
+        init_cuda_graph_state retains -- a per-capture allocation is freed
+        when the next capture rebinds forward_metadata, and every later
+        replay of this tier then gathers through recycled memory."""
+        num_draft_tokens = 2
+        bs = 2
+        backend, _ = _graph_backend(num_draft_tokens, max_bs=4)
+        base = _graph_base([1] * bs, num_draft_tokens)
+        metadata = MiniCPMSparseMetadata(base=base)
+        backend._bind_sparse_verify_graph_metadata(
+            SimpleNamespace(batch_size=bs, spec_info=None), metadata, in_capture=True
+        )
+        for name in ("k1", "k2"):
+            layout = getattr(metadata, f"{name}_repeat")
+            retained = backend.decode_cuda_graph_metadata[f"{name}_repeat"]
+            self.assertEqual(layout.index.data_ptr(), retained.index.data_ptr())
+            self.assertEqual(
+                layout.cu_seqlens.data_ptr(), retained.cu_seqlens.data_ptr()
+            )
+            fresh = _plan_uniform_slab_segments(
+                batch_size=bs,
+                segment_rows=backend.max_context_len
+                // getattr(backend, f"{name}_kernel_stride"),
+                repeats=num_draft_tokens,
+                device="cpu",
+            )
+            self.assertTrue(torch.equal(layout.index, fresh.index))
+            self.assertTrue(torch.equal(layout.cu_seqlens, fresh.cu_seqlens))
+
+    def test_capture_skips_k2_repeat_binding_under_fused_topk(self):
+        """Regression: under minicpm_fuse_topk the captured gather reads no
+        k2 repeat layout, so capture must skip the k2 binding; k1 still
+        binds prefix views of the retained slab."""
+        num_draft_tokens = 2
+        bs = 2
+        with (
+            backend_module.envs.SGLANG_MINICPM_FUSE_TOPK.override(True),
+            patch.object(
+                backend_module.MiniCPMSparseBackend,
+                "_get_fused_topk_kernel",
+                return_value=None,
+            ),
+        ):
+            backend, _ = _graph_backend(num_draft_tokens, max_bs=4)
+            base = _graph_base([1] * bs, num_draft_tokens)
+            metadata = MiniCPMSparseMetadata(base=base)
+            backend._bind_sparse_verify_graph_metadata(
+                SimpleNamespace(batch_size=bs, spec_info=None),
+                metadata,
+                in_capture=True,
+            )
+            retained = backend.decode_cuda_graph_metadata["k1_repeat"]
+            self.assertEqual(
+                metadata.k1_repeat.index.data_ptr(), retained.index.data_ptr()
+            )
+            self.assertIsNone(metadata.k2_repeat)
+            self.assertNotIn("k2_repeat", backend.decode_cuda_graph_metadata)
+
+    def test_capture_compression_view_covers_retained_slab(self):
+        """Regression: the captured gather reads the repeat layout's index,
+        which spans the uniform slab, so the compression view sized from
+        cu_seqlens_cpu must cover that slab -- a dense-window seed lets the
+        captured index_select read past the view."""
+        num_draft_tokens = 2
+        bs = 2
+        backend, _ = _graph_backend(num_draft_tokens, max_bs=4)
+        base = _graph_base([1] * bs, num_draft_tokens)
+        metadata = MiniCPMSparseMetadata(base=base)
+        backend._bind_sparse_verify_graph_metadata(
+            SimpleNamespace(batch_size=bs, spec_info=None), metadata, in_capture=True
+        )
+        for name in ("k1", "k2"):
+            level = getattr(metadata, name)
+            segment_rows = backend.max_context_len // getattr(
+                backend, f"{name}_kernel_stride"
+            )
+            self.assertEqual(
+                level.cu_seqlens_cpu,
+                [row * segment_rows for row in range(bs + 1)],
+            )
+            self.assertLess(
+                int(getattr(metadata, f"{name}_repeat").index.max()),
+                level.cu_seqlens_cpu[-1],
+            )
+
+    def test_replay_refreshes_static_buffers_to_eager_geometry(self):
+        """Replay must leave the static buffers holding the same verify
+        geometry the eager builder computes for the real batch, zero the
+        padded rows so they plan and fill nothing, and keep the cumulative
+        row lengths equal to the row lengths the selection fill writes."""
+        num_draft_tokens = 2
+        backend, _ = _graph_backend(num_draft_tokens, max_bs=4)
+        hg = backend.head_group_num
+        real_seq_lens = [100, 130, 126]
+        padded_seq_lens = [*real_seq_lens, 1]
+        bs, real_bs = len(padded_seq_lens), len(real_seq_lens)
+        base = _graph_base(padded_seq_lens, num_draft_tokens)
+
+        capture_batch = SimpleNamespace(batch_size=bs, spec_info=None)
+        backend._bind_sparse_verify_graph_metadata(
+            capture_batch, MiniCPMSparseMetadata(base=base), in_capture=True
+        )
+        # The FlashAttention replay refreshes the base buffers the capture
+        # seeding overwrote.
+        base.cache_seqlens_int32.copy_(
+            torch.tensor(padded_seq_lens, dtype=torch.int32) + num_draft_tokens
+        )
+        base.cu_seqlens_k.copy_(
+            F.pad(
+                torch.cumsum(base.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
+            )
+        )
+
+        forward_batch = SimpleNamespace(
+            batch_size=bs,
+            num_padding=bs - real_bs,
+            seq_lens=torch.tensor(padded_seq_lens, dtype=torch.int32),
+            seq_lens_cpu=torch.tensor(padded_seq_lens, dtype=torch.int32),
+            req_pool_indices=torch.tensor([2, 5, 1, 0]),
+            spec_info=None,
+        )
+        metadata = MiniCPMSparseMetadata(base=base)
+        backend._bind_sparse_verify_graph_metadata(
+            forward_batch, metadata, in_capture=False
+        )
+        backend._replay_sparse_verify_graph_metadata(forward_batch, metadata)
+
+        eager_batch, eager_base = _verify_batch(real_seq_lens, num_draft_tokens)
+        eager = MiniCPMSparseMetadata(base=eager_base)
+        _plan_sparse_verify(
+            forward_batch=eager_batch,
+            metadata=eager,
+            head_group_num=hg,
+            heads_per_group=backend.heads_per_group,
+            dense_len=backend.dense_len,
+            sparse_topk=backend.sparse_topk,
+            block_size=backend.block_size,
+            num_draft_tokens=num_draft_tokens,
+        )
+        real_rows = real_bs * num_draft_tokens * hg
+        row_lens = metadata.sparse_cache_seqlens_int32
+        self.assertTrue(
+            torch.equal(row_lens[:real_rows], eager.sparse_cache_seqlens_int32)
+        )
+        self.assertTrue((row_lens[real_rows:] == 0).all())
+        self.assertTrue(
+            torch.equal(
+                metadata.sparse_cu_seqlens_k,
+                F.pad(torch.cumsum(row_lens, dim=0, dtype=torch.int32), (1, 0)),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.token_pos_in_bs[: real_bs * num_draft_tokens],
+                eager.token_pos_in_bs,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.token_to_bs,
+                torch.repeat_interleave(
+                    torch.arange(bs, dtype=torch.int32), num_draft_tokens
+                ),
+            )
+        )
+
+        # Decode-form selection geometry: one single-query row per draft
+        # token, per-row cache length = causal position - 1 (matching the
+        # eager builder), and the static arange buffers sliced per row.
+        num_real_tokens = real_bs * num_draft_tokens
+        self.assertTrue(
+            torch.equal(
+                metadata.cache_seqlens_int32_stage1[:num_real_tokens],
+                eager.cache_seqlens_int32_stage1,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.verify_dense_mask[:num_real_tokens],
+                eager.verify_dense_mask,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.topk_cu_seqlens_q,
+                torch.arange(bs * num_draft_tokens + 1, dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.cu_seqlens_q_adjusted,
+                torch.arange(bs * num_draft_tokens + 1, dtype=torch.int32)
+                * backend.heads_per_group,
+            )
+        )
+        self.assertEqual(metadata.topk_max_seqlen_q, 1)
+        self.assertEqual(metadata.max_seqlen_q_adjusted, backend.heads_per_group)
+
+        # The uniform slab write offsets seeded at capture must survive the
+        # replay refresh -- the static repeat index depends on them.
+        for name, kernel_stride in (
+            ("k1", backend.k1_kernel_stride),
+            ("k2", backend.k2_kernel_stride),
+        ):
+            self.assertTrue(
+                torch.equal(
+                    getattr(metadata, name).cu_total_compress_token_nums,
+                    torch.arange(bs + 1, dtype=torch.int32)
+                    * (backend.max_context_len // kernel_stride),
+                ),
+                name,
+            )
+
+        # K1/K2 static tables must cover prefix + draft tokens (closed-form
+        # reference), pad their tails with the last cumulative value, and
+        # gather the per-request token tables for the padded batch.
+        seq_tensor = torch.tensor(real_seq_lens, dtype=torch.int32)
+        for name, kernel_size, kernel_stride in (
+            ("k1", backend.k1_kernel_size, backend.k1_kernel_stride),
+            ("k2", backend.k2_kernel_size, backend.k2_kernel_stride),
+        ):
+            level = getattr(metadata, name)
+            expected_lens = torch.clamp(
+                (seq_tensor + num_draft_tokens - kernel_size) // kernel_stride + 1,
+                min=0,
+            )
+            expected_cu = F.pad(
+                torch.cumsum(expected_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            self.assertTrue(
+                torch.equal(level.cu_seqlens[: real_bs + 1], expected_cu), name
+            )
+            self.assertTrue((level.cu_seqlens[real_bs + 1 :] == expected_cu[-1]).all())
+            self.assertTrue((level.history_compress_token_nums[real_bs:] == 0).all())
+            table = getattr(backend, f"req_to_sparse_{name}_token")
+            self.assertTrue(
+                torch.equal(level.table, table[forward_batch.req_pool_indices])
+            )
+
+    def test_all_padding_replay_zeroes_compression_buffers(self):
+        """Bug regression: an all-padding verify replay must zero the k1/k2
+        per-round compression lengths -- stale counts otherwise feed the
+        captured compression kernels -- while cu_total_compress_token_nums
+        keeps the capture-time slab offsets the static repeat index reads."""
+        num_draft_tokens = 2
+        bs = 2
+        backend, _ = _graph_backend(num_draft_tokens, max_bs=bs)
+        base = _graph_base([1] * bs, num_draft_tokens)
+        backend._bind_sparse_verify_graph_metadata(
+            SimpleNamespace(batch_size=bs, spec_info=None),
+            MiniCPMSparseMetadata(base=base),
+            in_capture=True,
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=bs,
+            num_padding=bs,
+            seq_lens=torch.ones(bs, dtype=torch.int32),
+            seq_lens_cpu=torch.ones(bs, dtype=torch.int32),
+            req_pool_indices=torch.arange(bs, dtype=torch.int64),
+            spec_info=None,
+        )
+        metadata = MiniCPMSparseMetadata(base=base)
+        backend._bind_sparse_verify_graph_metadata(
+            forward_batch, metadata, in_capture=False
+        )
+        refreshed_fields = (
+            "history_compress_token_nums",
+            "cu_seqlens",
+            "cu_new_token_nums",
+        )
+        # Dirty the refreshed fields as a previous non-padded replay would.
+        for name in ("k1", "k2"):
+            level = getattr(metadata, name)
+            for field in refreshed_fields:
+                getattr(level, field).fill_(7)
+
+        backend._replay_sparse_verify_graph_metadata(forward_batch, metadata)
+
+        self.assertTrue((metadata.sparse_cache_seqlens_int32 == 0).all())
+        self.assertTrue((metadata.sparse_cu_seqlens_k == 0).all())
+        self.assertTrue((metadata.cache_seqlens_int32_stage1 == 0).all())
+        for name, kernel_stride in (
+            ("k1", backend.k1_kernel_stride),
+            ("k2", backend.k2_kernel_stride),
+        ):
+            level = getattr(metadata, name)
+            for field in refreshed_fields:
+                buf = getattr(level, field)
+                self.assertTrue(
+                    (buf == 0).all(), f"{name}.{field} stale: {buf.tolist()}"
+                )
+            self.assertTrue(
+                torch.equal(
+                    level.cu_total_compress_token_nums,
+                    torch.arange(bs + 1, dtype=torch.int32)
+                    * (backend.max_context_len // kernel_stride),
+                ),
+                name,
+            )
+
+    def test_capture_seeds_consistent_plan(self):
+        """Capture-time binding must seed a self-consistent plan (cumulative
+        lengths equal to the row lengths, all rows live) at the assumed
+        prefix + draft geometry -- an inconsistent seed records a graph whose
+        kernel-side fill disagrees with the capture plan."""
+        num_draft_tokens = 2
+        backend, _ = _graph_backend(num_draft_tokens, max_bs=2)
+        base = _graph_base([1, 1], num_draft_tokens)
+        forward_batch = SimpleNamespace(batch_size=2, spec_info=None)
+        metadata = MiniCPMSparseMetadata(base=base)
+        backend._bind_sparse_verify_graph_metadata(
+            forward_batch, metadata, in_capture=True
+        )
+        rows = 2 * num_draft_tokens * backend.head_group_num
+        self.assertEqual(metadata.sparse_cache_seqlens_int32.shape[0], rows)
+        self.assertTrue((metadata.sparse_cache_seqlens_int32 > 0).all())
+        self.assertTrue(
+            torch.equal(
+                metadata.sparse_cu_seqlens_k,
+                F.pad(
+                    torch.cumsum(
+                        metadata.sparse_cache_seqlens_int32, dim=0, dtype=torch.int32
+                    ),
+                    (1, 0),
+                ),
+            )
+        )
+        assume_kv_len = backend.config_dense_len + num_draft_tokens
+        self.assertTrue(
+            torch.equal(
+                base.cu_seqlens_k,
+                torch.arange(3, dtype=torch.int32) * assume_kv_len,
+            )
+        )
+        # Magnitude pin: the seeded rows must equal the chain closed form at
+        # the capture seed geometry -- a constant seed would pass every
+        # check above.
+        _, chain_rows = _build_sparse_verify_replay_rows(
+            torch.full((2,), backend.config_dense_len, dtype=torch.int32),
+            head_group_num=backend.head_group_num,
+            dense_len=backend.dense_len,
+            sparse_topk=backend.sparse_topk,
+            block_size=backend.block_size,
+            num_draft_tokens=num_draft_tokens,
+        )
+        self.assertTrue(torch.equal(metadata.sparse_cache_seqlens_int32, chain_rows))
+
+    def test_dense_overwrite_matches_python_loop(self):
+        """The masked overwrite must write, exactly,
+        what the eager _copy_dense_page_table loop writes and nothing else."""
+        num_draft_tokens = 3
+        backend, _ = _make_backend(num_draft_tokens, eagle_topk=1, num_kv_heads=2)
+        hg = backend.head_group_num
+        seq_lens = [60, 126, 500]
+        bs = len(seq_lens)
+        width = max(backend.dense_len, backend.num_sparse_topk_tokens)
+        generator = torch.Generator().manual_seed(0)
+        page_table = torch.randint(
+            0, 500, (bs, 1024), dtype=torch.int32, generator=generator
+        )
+        original = torch.randint(
+            0,
+            500,
+            (bs * num_draft_tokens * hg, width),
+            dtype=torch.int32,
+            generator=generator,
+        )
+        token_pos_in_bs = torch.tensor(
+            [s + d + 1 for s in seq_lens for d in range(num_draft_tokens)],
+            dtype=torch.int32,
+        )
+        token_to_bs = torch.repeat_interleave(
+            torch.arange(bs, dtype=torch.int32), num_draft_tokens
+        )
+        dense_rows, dense_mask = _build_dense_verify_overwrite(
+            token_pos_in_bs,
+            token_to_bs,
+            page_table,
+            dense_len=backend.dense_len,
+            head_group_num=hg,
+        )
+        metadata = SimpleNamespace(
+            sparse_page_table=original.clone(),
+            verify_dense_rows=dense_rows,
+            verify_dense_mask=dense_mask,
+        )
+        reference = original.clone()
+        for batch_idx, seq_len in enumerate(seq_lens):
+            for draft_idx in range(num_draft_tokens):
+                kv_len = seq_len + draft_idx + 1
+                if kv_len < backend.dense_len:
+                    _copy_dense_page_table(
+                        reference,
+                        (batch_idx * num_draft_tokens + draft_idx) * hg,
+                        page_table,
+                        batch_idx,
+                        kv_len,
+                        hg,
+                    )
+
+        backend._overwrite_dense_verify_rows(metadata)
+
+        self.assertTrue(torch.equal(metadata.sparse_page_table, reference))
+        # The batch spans both regimes, so some rows must actually change.
+        self.assertFalse(torch.equal(reference, original))
 
 
 class TestFusedTopkRepeatGate(CustomTestCase):
