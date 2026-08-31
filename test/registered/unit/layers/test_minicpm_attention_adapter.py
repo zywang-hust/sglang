@@ -183,8 +183,8 @@ class TestMiniCPMAttentionAdapter(CustomTestCase):
         self.assertIs(adapter.active_wrapper, wrapper)
 
     def test_flashinfer_plan_pins_deterministic_split_schedule(self):
-        """Regression: every plan call must forward the backend's deterministic
-        split pinning, or decode row counts change the split-KV chunk order."""
+        """Regression: every plan call must forward the deterministic split pinning,
+        or decode and target-verify row counts change the split-KV chunk order."""
         adapter = _adapter_stub(num_qo_heads=16, head_dim=128)
         decode_wrapper = SimpleNamespace(begin_forward=Mock())
         graph_wrapper = SimpleNamespace(begin_forward=Mock())
@@ -260,6 +260,7 @@ class TestMiniCPMAttentionAdapter(CustomTestCase):
                 head_dim=128,
                 page_size=1,
                 max_kv_tokens_per_row=7,
+                rows_per_req=2,
             )
 
         metadata = _metadata(rows=2)

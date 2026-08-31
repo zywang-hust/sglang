@@ -24,8 +24,10 @@ from sglang.srt.layers.attention.minicpm.sparse_utils import (
     MiniCPMSparseMetadata,
     _build_k1_k2_compression_metadata,
     _build_sparse_decode_metadata,
+    _plan_repeated_segments,
     _plan_sparse_decode,
     _plan_sparse_prefill,
+    _plan_sparse_verify,
     allocate_and_compress_keys,
     batched_gather,
     compressed_attention,
@@ -37,6 +39,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import next_power_of_2
 
@@ -227,6 +230,8 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.k2_kernel_size = self.kernel_size * 4
         self.k2_kernel_stride = self.kernel_stride * 4
 
+        self._init_spec_decode_config()
+
         self.minicpm_fuse_topk = (
             use_blackwell and use_flashinfer
         ) or envs.SGLANG_MINICPM_FUSE_TOPK.get()
@@ -300,6 +305,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                     self.dense_len,
                     self.num_sparse_topk_tokens,
                 ),
+                rows_per_req=self.head_group_num
+                * (self.speculative_num_draft_tokens or 1),
             )
             if use_flashinfer
             else MiniCPMFlashAttentionAdapter(self.flash_attn_backend)
@@ -313,6 +320,17 @@ class MiniCPMSparseBackend(AttentionBackend):
             isinstance(self.attention_adapter, MiniCPMFlashInferAdapter)
             and self.flash_attn_backend.kv_cache_dtype_str == "auto"
         )
+
+    def _init_spec_decode_config(self):
+        spec = get_spec()
+        self.speculative_num_draft_tokens = spec.speculative_num_draft_tokens
+        # A target-only server carries no speculative args (eagle_topk is
+        # None); treat that as chain drafts.
+        if (spec.speculative_eagle_topk or 1) > 1:
+            raise NotImplementedError(
+                "MiniCPM backend target verify supports chain drafts only "
+                "(speculative_eagle_topk == 1)"
+            )
 
     def _get_fused_topk_kernel(self, batch_size: int, *, is_prefill: bool):
         if not self.minicpm_fuse_topk:
@@ -336,6 +354,10 @@ class MiniCPMSparseBackend(AttentionBackend):
     def update_batch_for_sparse(
         self, forward_batch: ForwardBatch, metadata: MiniCPMSparseMetadata
     ):
+        if forward_batch.forward_mode.is_target_verify():
+            self._update_batch_for_verify(forward_batch, metadata)
+            return
+
         metadata.k1, metadata.k2 = _build_k1_k2_compression_metadata(
             req_pool_indices=forward_batch.req_pool_indices,
             base_metadata=metadata.base,
@@ -382,11 +404,53 @@ class MiniCPMSparseBackend(AttentionBackend):
                 head_group_num=self.head_group_num,
             )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_target_verify():
-            raise NotImplementedError(
-                "MiniCPM backend does not support speculative decoding (target verify)"
+    def _update_batch_for_verify(
+        self,
+        forward_batch: ForwardBatch,
+        metadata: MiniCPMSparseMetadata,
+    ):
+        # seq_lens + num_draft_tokens: compression must cover the draft keys
+        # too, or block scoring never sees the proposed tokens.
+        metadata.k1, metadata.k2 = _build_k1_k2_compression_metadata(
+            req_pool_indices=forward_batch.req_pool_indices,
+            base_metadata=metadata.base,
+            req_to_sparse_k1_token=self.req_to_sparse_k1_token,
+            req_to_sparse_k2_token=self.req_to_sparse_k2_token,
+            k1_kernel_size=self.k1_kernel_size,
+            k1_kernel_stride=self.k1_kernel_stride,
+            k2_kernel_size=self.k2_kernel_size,
+            k2_kernel_stride=self.k2_kernel_stride,
+            cu_seqlens_q=metadata.base.cu_seqlens_q,
+            seq_lens_cpu=(
+                forward_batch.seq_lens_cpu + self.speculative_num_draft_tokens
+            ),
+        )
+        _plan_sparse_verify(
+            forward_batch,
+            metadata,
+            head_group_num=self.head_group_num,
+            heads_per_group=self.heads_per_group,
+            dense_len=self.dense_len,
+            sparse_topk=self.sparse_topk,
+            block_size=self.block_size,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+        )
+        # Varlen segments cannot be shared across verify rows.
+        metadata.k1_repeat = _plan_repeated_segments(
+            metadata.k1.cu_seqlens,
+            total_tokens=metadata.k1.cu_seqlens_cpu[-1],
+            repeats=self.speculative_num_draft_tokens,
+        )
+        # The fused top-k scores on the k1 level alone,
+        # so the k2 repeat layout has no readers under minicpm_fuse_topk.
+        if not self.minicpm_fuse_topk:
+            metadata.k2_repeat = _plan_repeated_segments(
+                metadata.k2.cu_seqlens,
+                total_tokens=metadata.k2.cu_seqlens_cpu[-1],
+                repeats=self.speculative_num_draft_tokens,
             )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
             raise NotImplementedError(
                 "MiniCPM backend does not support draft extend mode"
@@ -398,10 +462,15 @@ class MiniCPMSparseBackend(AttentionBackend):
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = metadata
             return
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
         self.update_batch_for_sparse(forward_batch, metadata)
         self.attention_adapter.prepare_forward(
             metadata,
-            is_prefill=not forward_batch.forward_mode.is_decode_or_idle(),
+            # Verify rows are single-query paged-decode rows,
+            # so they plan on the decode wrapper; verify dispatches as an extend.
+            is_prefill=not (
+                forward_batch.forward_mode.is_decode_or_idle() or is_target_verify
+            ),
             graph=False,
         )
         self.forward_metadata = metadata
@@ -519,6 +588,14 @@ class MiniCPMSparseBackend(AttentionBackend):
             )
             compressed_cu_seqlens = metadata.k1.cu_seqlens
             compressed_cu_seqlens2 = metadata.k2.cu_seqlens
+            if metadata.k1_repeat is not None:
+                compressed_k = compressed_k.index_select(0, metadata.k1_repeat.index)
+                compressed_cu_seqlens = metadata.k1_repeat.cu_seqlens
+                if metadata.k2_repeat is not None:
+                    compressed_k2 = compressed_k2.index_select(
+                        0, metadata.k2_repeat.index
+                    )
+                    compressed_cu_seqlens2 = metadata.k2_repeat.cu_seqlens
 
             ret = self.sparse_get_topk_impl(
                 query_states,
@@ -554,9 +631,8 @@ class MiniCPMSparseBackend(AttentionBackend):
         cache_lens = None
         if max_seqlen_in_batch_k > max_seqlen_in_batch_q:
             if max_seqlen_in_batch_q == 1:
-                # One query token per row.
-                # Decode rows: the staged stage-1 lens equals seq_lens_k - seq_lens_q,
-                # the kv length excluding the current token.
+                # Single-query rows: decode stages kv_len - 1 (seq_lens_k - seq_lens_q),
+                # verify stages each draft row's causal prefix (token position - 1).
                 cache_lens = self.forward_metadata.cache_seqlens_int32_stage1
             else:
                 # Extend over a cached prefix: per-segment kv positions
@@ -632,6 +708,18 @@ class MiniCPMSparseBackend(AttentionBackend):
         if forward_batch.forward_mode.is_draft_extend_v2():
             raise NotImplementedError(
                 "MiniCPM backend does not support draft extend mode"
+            )
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_paged_rows(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                sinks=sinks,
             )
 
         if k is not None:
@@ -908,6 +996,16 @@ class MiniCPMSparseBackend(AttentionBackend):
         ).reshape(-1, self.num_sparse_topk_tokens)
         destination = metadata.sparse_page_table[:, : self.num_sparse_topk_tokens]
         torch.where(metadata.sparse_row_mask, topk_rows, destination, out=destination)
+        if metadata.verify_dense_rows is not None:
+            self._overwrite_dense_verify_rows(metadata)
+
+    def _overwrite_dense_verify_rows(self, metadata: MiniCPMSparseMetadata):
+        # Rows read the prefix pages exactly as _copy_dense_page_table writes them.
+        src = metadata.verify_dense_rows
+        rows = metadata.sparse_page_table.view(src.shape[0], self.head_group_num, -1)
+        rows[:, :, : src.shape[2]] = torch.where(
+            metadata.verify_dense_mask, src, rows[:, :, : src.shape[2]]
+        )
 
     def forward_decode(
         self,
