@@ -467,10 +467,19 @@ class MiniCPMSparseMetadata(msgspec.Struct):
     # Stage-1 query geometry expanded to one row per (token, head group).
     cu_seqlens_q_adjusted: Optional[torch.Tensor] = None
     max_seqlen_q_adjusted: int = 1
+    # Selection varlen geometry: one segment per request (decode), per draft token
+    # (verify), per sparse request (prefill); under graphs topk_max_seqlen_k is static.
     topk_cu_seqlens_q: Optional[torch.Tensor] = None
     topk_cu_seqlens_k: Optional[torch.Tensor] = None
     topk_max_seqlen_q: int = 1
     topk_max_seqlen_k: int = 1
+    # Tree-draft verify only (None for chains): flat [bs * ndt * ndt] visibility square,
+    # per-token visible counts, prefix lengths, and chain-form fill-bound row lengths.
+    verify_draft_tree_mask: Optional[torch.Tensor] = None
+    # Graph paths only; eager tree planning keeps the visible counts local.
+    verify_num_visible: Optional[torch.Tensor] = None
+    verify_prefix_lens: Optional[torch.Tensor] = None
+    verify_source_row_lens: Optional[torch.Tensor] = None
 
 
 def _assign_row_metadata(
@@ -564,8 +573,8 @@ def _build_k1_k2_compression_metadata(
     k1_kernel_stride: int,
     k2_kernel_size: int,
     k2_kernel_stride: int,
-    cu_seqlens_q: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
+    history_lens: Optional[torch.Tensor] = None,
 ) -> tuple[CompressionLevelMetadata, CompressionLevelMetadata]:
     seq_lens_cpu = torch.as_tensor(
         seq_lens_cpu,
@@ -576,8 +585,14 @@ def _build_k1_k2_compression_metadata(
     token_nums = (
         base_metadata.cu_seqlens_k[1 : bs + 1] - base_metadata.cu_seqlens_k[:bs]
     )
-    input_lens = cu_seqlens_q[1 : bs + 1] - cu_seqlens_q[:bs]
-    history_lens = token_nums - input_lens
+    # history_lens is the reuse boundary: chunks ending at or before it are read from
+    # the persistent cache; tree verify passes prefix - num_draft_tokens (keys moved).
+    if history_lens is None:
+        cu_seqlens_q = base_metadata.cu_seqlens_q
+        input_lens = cu_seqlens_q[1 : bs + 1] - cu_seqlens_q[:bs]
+        history_lens = token_nums - input_lens
+    else:
+        history_lens = history_lens.to(dtype=token_nums.dtype)
 
     return tuple(
         _compute_single_compression_metadata(
@@ -825,6 +840,38 @@ def _plan_repeated_segments(
     return RepeatedSegmentLayout(index=index, cu_seqlens=out_cu_seqlens)
 
 
+def _build_tree_verify_base_geometry(
+    forward_batch: ForwardBatch,
+    *,
+    req_to_token: torch.Tensor,
+    num_draft_tokens: int,
+    eager_max_k: int,
+) -> FlashAttentionMetadata:
+    # Mirrors the chain-draft layout FlashAttentionBackend.init_forward_metadata builds;
+    # FA shapes tree metadata differently, so trees build this one explicitly.
+    metadata = FlashAttentionMetadata()
+    metadata.cache_seqlens_int32 = (forward_batch.seq_lens + num_draft_tokens).to(
+        torch.int32
+    )
+    metadata.max_seq_len_q = num_draft_tokens
+    metadata.max_seq_len_k = eager_max_k + num_draft_tokens
+    metadata.cu_seqlens_q = torch.arange(
+        0,
+        forward_batch.batch_size * num_draft_tokens + 1,
+        num_draft_tokens,
+        dtype=torch.int32,
+        device=forward_batch.seq_lens.device,
+    )
+    metadata.cu_seqlens_k = F.pad(
+        torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
+        (1, 0),
+    )
+    metadata.page_table = req_to_token[
+        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+    ]
+    return metadata
+
+
 def _plan_sparse_verify(
     forward_batch: ForwardBatch,
     metadata: MiniCPMSparseMetadata,
@@ -835,6 +882,7 @@ def _plan_sparse_verify(
     sparse_topk: int,
     block_size: int,
     num_draft_tokens: int,
+    num_draft_visible: Optional[torch.Tensor] = None,
 ) -> None:
     base_metadata = metadata.base
     bs = forward_batch.batch_size
@@ -850,7 +898,7 @@ def _plan_sparse_verify(
         bs * num_draft_tokens + 1, dtype=torch.int32, device=device
     )
 
-    token_pos_in_bs, sparse_cache_seqlens_int32 = _build_sparse_verify_rows(
+    token_pos_in_bs, source_row_lens = _build_sparse_verify_rows(
         forward_batch.seq_lens,
         head_group_num=head_group_num,
         dense_len=dense_len,
@@ -858,19 +906,35 @@ def _plan_sparse_verify(
         block_size=block_size,
         num_draft_tokens=num_draft_tokens,
     )
-    # Every verify row takes the selection output; the dense rows are then
-    # overwritten from the prefix pages, so the mask is uniformly True.
-    metadata.sparse_row_mask = torch.ones((rows, 1), dtype=torch.bool, device=device)
-    if dense_len > 0:
-        metadata.verify_dense_rows, metadata.verify_dense_mask = (
-            _build_dense_verify_overwrite(
-                token_pos_in_bs,
-                token_to_bs,
-                base_metadata.page_table,
-                dense_len=dense_len,
-                head_group_num=head_group_num,
-            )
+    sparse_cache_seqlens_int32 = source_row_lens
+    if num_draft_visible is not None:
+        token_offsets = torch.arange(
+            1, num_draft_tokens + 1, dtype=torch.int32, device=device
+        ).repeat(bs)
+        invisible = token_offsets - num_draft_visible
+        sparse_cache_seqlens_int32 = source_row_lens - invisible.repeat_interleave(
+            head_group_num
         )
+        metadata.verify_prefix_lens = forward_batch.seq_lens.to(torch.int32)
+        metadata.verify_source_row_lens = source_row_lens
+    else:
+        # Every verify row takes the selection output; the dense rows are then
+        # overwritten from the prefix pages, so the mask is uniformly True.
+        metadata.sparse_row_mask = torch.ones(
+            (rows, 1), dtype=torch.bool, device=device
+        )
+        if dense_len > 0:
+            # Trees fill their dense rows via the compaction kernels;
+            # only chain verify reads the masked-copy buffers.
+            metadata.verify_dense_rows, metadata.verify_dense_mask = (
+                _build_dense_verify_overwrite(
+                    token_pos_in_bs,
+                    token_to_bs,
+                    base_metadata.page_table,
+                    dense_len=dense_len,
+                    head_group_num=head_group_num,
+                )
+            )
     # The selection fill must write exactly these row lengths, row for row;
     # the FlashInfer plan consumes them.
     _assign_row_metadata(

@@ -830,7 +830,6 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             token_pos_in_bs=torch.tensor([2, 10], dtype=torch.int32),
             seqlen_k_sparse_bs_tensor=torch.tensor([2, 10], dtype=torch.int32),
             sparse_row_mask=torch.tensor([[False], [True]]),
-            dense_rows=[],
         )
         backend.head_group_num = 1
         backend.heads_per_group = 1
@@ -991,6 +990,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend.k1_kernel_stride = 16
         backend.k2_kernel_size = 128
         backend.k2_kernel_stride = 64
+        backend.speculative_eagle_topk = 1
         backend.speculative_num_draft_tokens = None
 
         backend.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
@@ -1378,7 +1378,6 @@ import sglang.srt.layers.attention.minicpm.backend
             k1_kernel_stride=config.k1_kernel_stride,
             k2_kernel_size=config.k2_kernel_size,
             k2_kernel_stride=config.k2_kernel_stride,
-            cu_seqlens_q=base_metadata.cu_seqlens_q,
             seq_lens_cpu=_SingleTensorConversion([100, 200, 300]),
         )
 

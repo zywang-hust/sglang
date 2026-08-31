@@ -10,9 +10,12 @@ import torch.nn.functional as F
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.minicpm_fixtures import (
+    make_sparse_backend,
     make_spec_backend,
     make_verify_batch,
     plan_verify,
+    tree_mask_from_parents,
+    visible_counts,
 )
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -35,7 +38,7 @@ SPARSE_TOPK = 96
 CAPACITY = SPARSE_TOPK * BLOCK_SIZE
 
 
-def _plan(seq_lens, num_draft_tokens, dense_len):
+def _plan(seq_lens, num_draft_tokens, dense_len, num_draft_visible=None):
     return plan_verify(
         seq_lens,
         num_draft_tokens,
@@ -44,6 +47,7 @@ def _plan(seq_lens, num_draft_tokens, dense_len):
         dense_len=dense_len,
         sparse_topk=SPARSE_TOPK,
         block_size=BLOCK_SIZE,
+        num_draft_visible=num_draft_visible,
     )
 
 
@@ -142,6 +146,75 @@ class TestVerifyMetadataClosedForm(CustomTestCase):
         )
 
 
+class TestTreeVerifyMetadata(CustomTestCase):
+    def test_chain_mask_degenerates_to_chain_rows(self):
+        """A fully-visible tree mask must reproduce the chain builder's row lengths,
+        bitwise."""
+        num_draft_tokens = 4
+        seq_lens = [1, 100, 126, 6141, 6144, 8189]
+        bs = len(seq_lens)
+        chain_mask = tree_mask_from_parents([-1, 0, 1, 2]).view(-1).repeat(bs)
+        counts = visible_counts(
+            mask=chain_mask, bs=bs, num_draft_tokens=num_draft_tokens
+        )
+        for dense_len in (8192, 128, 0):
+            _, _, chain = _plan(seq_lens, num_draft_tokens, dense_len)
+            _, _, tree = _plan(
+                seq_lens, num_draft_tokens, dense_len, num_draft_visible=counts
+            )
+            self.assertTrue(
+                torch.equal(
+                    tree.sparse_cache_seqlens_int32,
+                    chain.sparse_cache_seqlens_int32,
+                ),
+                f"dense_len={dense_len}",
+            )
+            self.assertTrue(
+                torch.equal(tree.sparse_cu_seqlens_k, chain.sparse_cu_seqlens_k)
+            )
+            # The chain form also bounds the pre-compaction fill.
+            self.assertTrue(
+                torch.equal(
+                    tree.verify_source_row_lens,
+                    chain.sparse_cache_seqlens_int32,
+                )
+            )
+
+    def test_tree_rows_subtract_invisible_draft_keys(self):
+        """Tree row length = chain closed form -
+        (token offset - |ancestors incl. self|)."""
+        num_draft_tokens = 5
+        parents = [-1, 0, 0, 2, 1]
+        mask = tree_mask_from_parents(parents)
+        seq_lens = [100, 6141, 6144, 8189]
+        bs = len(seq_lens)
+        counts = visible_counts(
+            mask=mask.view(-1).repeat(bs), bs=bs, num_draft_tokens=num_draft_tokens
+        )
+        for dense_len in (8192, 0):
+            _, _, chain = _plan(seq_lens, num_draft_tokens, dense_len)
+            _, _, verify = _plan(
+                seq_lens, num_draft_tokens, dense_len, num_draft_visible=counts
+            )
+            row_lens = verify.sparse_cache_seqlens_int32
+            for batch_idx, seq_len in enumerate(seq_lens):
+                for draft_idx in range(num_draft_tokens):
+                    ancestors = 0
+                    node = draft_idx
+                    while node != -1:
+                        ancestors += 1
+                        node = parents[node]
+                    row = (batch_idx * num_draft_tokens + draft_idx) * HEAD_GROUP
+                    chain_len = int(chain.sparse_cache_seqlens_int32[row])
+                    expected = chain_len - (draft_idx + 1 - ancestors)
+                    self.assertEqual(
+                        int(row_lens[row]),
+                        expected,
+                        f"seq_len={seq_len} draft_idx={draft_idx} "
+                        f"dense_len={dense_len}",
+                    )
+
+
 class TestPlanRepeatedSegments(CustomTestCase):
     def test_segments_repeat_per_draft_token(self):
         flat = torch.arange(5, dtype=torch.float32).view(5, 1, 1)
@@ -184,7 +257,7 @@ class TestPlanRepeatedSegments(CustomTestCase):
         )
 
 
-def _verify_forward_batch(seq_lens, num_draft_tokens, spec_info=None):
+def _verify_forward_batch(seq_lens, num_draft_tokens, spec_info=None, tree_base=False):
     forward_batch, base_metadata = make_verify_batch(seq_lens, num_draft_tokens)
     forward_batch.spec_info = spec_info
     forward_batch.req_pool_indices = torch.arange(len(seq_lens), dtype=torch.int64)
@@ -194,6 +267,18 @@ def _verify_forward_batch(seq_lens, num_draft_tokens, spec_info=None):
         is_target_verify=lambda: True,
         is_decode_or_idle=lambda: False,
     )
+    if tree_base:
+        # Mimic FA's topk>1 two-phase layout:
+        # prefix-only cache lengths and page-table rows.
+        prefix = torch.tensor(seq_lens, dtype=torch.int32)
+        base_metadata.cache_seqlens_int32 = prefix
+        base_metadata.max_seq_len_k = int(prefix.max())
+        base_metadata.cu_seqlens_k = F.pad(
+            torch.cumsum(prefix, dim=0, dtype=torch.int32), (1, 0)
+        )
+        base_metadata.page_table = torch.zeros(
+            (len(seq_lens), int(prefix.max())), dtype=torch.int32
+        )
     return forward_batch, base_metadata
 
 
@@ -211,6 +296,17 @@ def _k1_k2_stub() -> tuple[SimpleNamespace, SimpleNamespace]:
 
 
 class TestBackendVerifyMetadata(CustomTestCase):
+    def test_tree_drafts_reject_short_window(self):
+        """Tree rows drop hidden draft keys from the chain row length, which
+        only holds when the local window keeps every draft key's block."""
+        with self.assertRaisesRegex(ValueError, "window_size >= 66"):
+            make_sparse_backend(
+                server_args_overrides={
+                    "speculative_num_draft_tokens": 2,
+                    "speculative_eagle_topk": 2,
+                },
+                window_size=64,
+            )
 
     def test_init_forward_metadata_builds_verify_metadata(self):
         num_draft_tokens = 2
@@ -229,14 +325,15 @@ class TestBackendVerifyMetadata(CustomTestCase):
             backend.init_forward_metadata(forward_batch)
 
         metadata = backend.forward_metadata
-        # K1/K2 tables cover prefix + draft tokens.
+        # K1/K2 tables cover prefix + draft tokens;
+        # chain rounds keep the default reuse boundary.
         kwargs = build_k1_k2.call_args.kwargs
         self.assertTrue(
             torch.equal(
                 kwargs["seq_lens_cpu"], forward_batch.seq_lens_cpu + num_draft_tokens
             )
         )
-        self.assertIs(kwargs["cu_seqlens_q"], base_metadata.cu_seqlens_q)
+        self.assertIsNone(kwargs["history_lens"])
 
         self.assertEqual(metadata.k1_repeat.index.tolist(), [0, 0, 1, 2, 1, 2])
         self.assertEqual(metadata.k1_repeat.cu_seqlens.tolist(), [0, 1, 2, 4, 6])
@@ -257,9 +354,104 @@ class TestBackendVerifyMetadata(CustomTestCase):
         prepare_kwargs = backend.attention_adapter.prepare_forward.call_args.kwargs
         self.assertFalse(prepare_kwargs["is_prefill"])
 
-    def test_tree_drafts_raise(self):
-        with self.assertRaisesRegex(NotImplementedError, "chain drafts only"):
-            make_spec_backend(num_draft_tokens=4, eagle_topk=2)
+    def test_tree_drafts_build_popcount_rows(self):
+        """eagle_topk > 1 must stage the tree mask and plan popcount row lengths."""
+        num_draft_tokens = 3
+        backend, flash_attn_backend = make_spec_backend(
+            num_draft_tokens=num_draft_tokens, eagle_topk=2
+        )
+        seq_lens = [3, 200]
+        bs = len(seq_lens)
+        # Root plus two sibling branches: node 2 hides node 1.
+        mask = tree_mask_from_parents([-1, 0, 0]).view(-1).repeat(bs)
+        custom_mask = torch.ones(1, dtype=torch.bool)
+        forward_batch, base_metadata = _verify_forward_batch(
+            seq_lens,
+            num_draft_tokens,
+            spec_info=SimpleNamespace(custom_mask=custom_mask),
+            tree_base=True,
+        )
+        flash_attn_backend.forward_metadata = base_metadata
+
+        def _stage_mask(*, out, num_visible_out, **kwargs):
+            out.copy_(mask)
+            num_visible_out.copy_(
+                visible_counts(mask=mask, bs=bs, num_draft_tokens=num_draft_tokens)
+            )
+
+        with (
+            patch.object(
+                backend_module,
+                "_build_k1_k2_compression_metadata",
+                return_value=_k1_k2_stub(),
+            ) as build_k1_k2,
+            patch.object(
+                backend_module, "copy_eagle_draft_tree_mask", side_effect=_stage_mask
+            ) as copy_mask,
+        ):
+            backend.init_forward_metadata(forward_batch)
+
+        copy_kwargs = copy_mask.call_args.kwargs
+        self.assertIs(copy_kwargs["custom_mask"], custom_mask)
+        self.assertIs(copy_kwargs["seq_lens"], forward_batch.seq_lens)
+
+        # Tree rounds roll the compression reuse boundary back by num_draft_tokens.
+        history_lens = build_k1_k2.call_args.kwargs["history_lens"]
+        self.assertEqual(history_lens.tolist(), [0, 200 - num_draft_tokens])
+
+        metadata = backend.forward_metadata
+        self.assertTrue(torch.equal(metadata.verify_draft_tree_mask, mask))
+        # Request 1's rows sit past the 192-token sparse capacity, so each clamps
+        # to capacity - block + token_pos % block: 137, 138, 139.
+        sc = [137, 138, 139]
+        self.assertEqual(
+            metadata.sparse_cache_seqlens_int32.tolist(),
+            [4, 5, 6 - 1, sc[0], sc[1], sc[2] - 1],
+        )
+        self.assertEqual(
+            metadata.verify_source_row_lens.tolist(),
+            [4, 5, 6, sc[0], sc[1], sc[2]],
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.verify_prefix_lens,
+                torch.tensor(seq_lens, dtype=torch.int32),
+            )
+        )
+
+        # Regression: FA's prefix-only tree metadata, consumed verbatim,
+        # gates every draft slot out of the fill;
+        # the backend must rebuild the uniform prefix + num_draft_tokens geometry.
+        base = metadata.base
+        self.assertEqual(
+            base.cache_seqlens_int32.tolist(),
+            [s + num_draft_tokens for s in seq_lens],
+        )
+        self.assertEqual(base.max_seq_len_k, max(seq_lens) + num_draft_tokens)
+        self.assertTrue(
+            torch.equal(
+                base.cu_seqlens_k,
+                F.pad(
+                    torch.cumsum(base.cache_seqlens_int32, dim=0, dtype=torch.int32),
+                    (1, 0),
+                ),
+            )
+        )
+        req_to_token = backend.req_to_token_pool.req_to_token
+        self.assertEqual(
+            base.page_table.shape,
+            (len(seq_lens), max(seq_lens) + num_draft_tokens),
+        )
+        self.assertTrue(
+            torch.equal(
+                base.page_table,
+                req_to_token[
+                    forward_batch.req_pool_indices,
+                    : max(seq_lens) + num_draft_tokens,
+                ],
+            )
+        )
+        self.assertIs(metadata.seqlen_k_sparse_bs_tensor, base.cache_seqlens_int32)
 
     def test_draft_extend_raises(self):
         backend, _ = make_spec_backend(num_draft_tokens=4, eagle_topk=1)
@@ -271,6 +463,12 @@ class TestBackendVerifyMetadata(CustomTestCase):
 
 
 class TestVerifyGraphBuffers(CustomTestCase):
+    def test_target_only_graph_state_skips_tree_buffers(self):
+        """Regression: a target-only server has eagle_topk None;
+        graph-buffer sizing must treat it as chain drafts instead of comparing None."""
+        backend, _ = make_spec_backend(num_draft_tokens=None, eagle_topk=None)
+        backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2)
+        self.assertNotIn("verify_draft_tree_mask", backend.decode_cuda_graph_metadata)
 
     def test_dense_overwrite_matches_python_loop(self):
         """The masked overwrite must write, exactly,

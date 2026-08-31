@@ -8,10 +8,14 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.minicpm_fixtures import (
     make_replay_backend,
     make_verify_batch,
+    pack_custom_mask,
+    plan_verify,
+    tree_mask_from_parents,
+    visible_counts,
 )
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -23,26 +27,27 @@ from sglang.srt.layers.attention.minicpm.sparse_utils import (
     MiniCPMSparseMetadata,
     _build_k1_k2_compression_metadata,
     _build_sparse_verify_rows,
+    _build_tree_verify_base_geometry,
     _plan_repeated_segments,
-    _plan_sparse_verify,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+
+DEVICE = "cuda"
 
 
-def _eager_verify(backend, seq_lens, num_draft_tokens):
+def _eager_verify(backend, seq_lens, num_draft_tokens, num_draft_visible=None):
     """Eager-builder oracle for the real (unpadded) batch."""
-    forward_batch, base_metadata = make_verify_batch(seq_lens, num_draft_tokens)
-    metadata = MiniCPMSparseMetadata(base=base_metadata)
-    _plan_sparse_verify(
-        forward_batch=forward_batch,
-        metadata=metadata,
+    _, _, metadata = plan_verify(
+        seq_lens,
+        num_draft_tokens,
         head_group_num=backend.head_group_num,
         heads_per_group=backend.heads_per_group,
         dense_len=backend.dense_len,
         sparse_topk=backend.sparse_topk,
         block_size=backend.block_size,
-        num_draft_tokens=num_draft_tokens,
+        num_draft_visible=num_draft_visible,
+        device=DEVICE,
     )
     return metadata
 
@@ -62,7 +67,7 @@ def _replay_verify_graph(
     forward_batch = SimpleNamespace(
         batch_size=bs,
         num_padding=bs - real_bs,
-        seq_lens=torch.tensor(padded_seq_lens, dtype=torch.int32),
+        seq_lens=torch.tensor(padded_seq_lens, dtype=torch.int32, device=DEVICE),
         seq_lens_cpu=torch.tensor(padded_seq_lens, dtype=torch.int32),
         req_pool_indices=req_pool_indices,
         spec_info=spec_info,
@@ -87,7 +92,7 @@ def _capture_seed(backend, base, *, bs):
 def _capture_seed_chain_rows(backend, num_draft_tokens):
     """The chain closed-form row lengths at the capture seed geometry."""
     _, chain_rows = _build_sparse_verify_rows(
-        torch.full((2,), backend.config_dense_len, dtype=torch.int32),
+        torch.full((2,), backend.config_dense_len, dtype=torch.int32, device=DEVICE),
         head_group_num=backend.head_group_num,
         dense_len=backend.dense_len,
         sparse_topk=backend.sparse_topk,
@@ -98,14 +103,47 @@ def _capture_seed_chain_rows(backend, num_draft_tokens):
 
 
 class TestVerifyGraphReplay(CustomTestCase):
+    def _assert_replay_rebuilds_base_geometry(
+        self, backend, base, forward_batch, padded_seq_lens, num_draft_tokens
+    ):
+        """The replay's in-place rebuild must reproduce the eager tree base builder,
+        field for field; nothing else holds the two closed forms equal."""
+        expected = _build_tree_verify_base_geometry(
+            forward_batch,
+            req_to_token=backend.req_to_token_pool.req_to_token,
+            num_draft_tokens=num_draft_tokens,
+            eager_max_k=max(padded_seq_lens),
+        )
+        self.assertTrue(
+            torch.equal(base.cache_seqlens_int32, expected.cache_seqlens_int32)
+        )
+        self.assertTrue(torch.equal(base.cu_seqlens_k, expected.cu_seqlens_k))
+        # The graph page table is max_context_len wide; only each row's live
+        # prefix + draft span is written.
+        for row, seq_len in enumerate(padded_seq_lens):
+            width = seq_len + num_draft_tokens
+            self.assertTrue(
+                torch.equal(
+                    base.page_table[row, :width], expected.page_table[row, :width]
+                ),
+                row,
+            )
 
     def _assert_level_buffers_match_eager_builder(
-        self, backend, metadata, forward_batch, real_seq_lens, num_draft_tokens
+        self,
+        backend,
+        metadata,
+        forward_batch,
+        real_seq_lens,
+        num_draft_tokens,
+        history_lens=None,
     ):
         """K1/K2 level buffers hold the eager compression builder's output for the
         real batch, with flat cumsum tails and zero history on the padded rows."""
         real_bs = len(real_seq_lens)
-        _, eager_base = make_verify_batch(real_seq_lens, num_draft_tokens)
+        _, eager_base = make_verify_batch(
+            real_seq_lens, num_draft_tokens, device=DEVICE
+        )
         expected = _build_k1_k2_compression_metadata(
             req_pool_indices=forward_batch.req_pool_indices[:real_bs],
             base_metadata=eager_base,
@@ -115,9 +153,9 @@ class TestVerifyGraphReplay(CustomTestCase):
             k1_kernel_stride=backend.k1_kernel_stride,
             k2_kernel_size=backend.k2_kernel_size,
             k2_kernel_stride=backend.k2_kernel_stride,
-            cu_seqlens_q=eager_base.cu_seqlens_q,
             seq_lens_cpu=torch.tensor(real_seq_lens, dtype=torch.int32)
             + num_draft_tokens,
+            history_lens=history_lens,
         )
         for name, want in zip(("k1", "k2"), expected):
             level = getattr(metadata, name)
@@ -173,8 +211,13 @@ class TestVerifyGraphReplay(CustomTestCase):
             # Lay the packed chunk rows out at the slab offsets the compression
             # kernel writes to, then gather both ways.
             packed_cu = eager_level.cu_seqlens
-            packed = torch.arange(int(packed_cu[-1]), dtype=torch.float32)
-            slab = torch.full((int(level.cu_total_compress_token_nums[-1]),), -1.0)
+            device = retained.index.device
+            packed = torch.arange(
+                int(packed_cu[-1]), dtype=torch.float32, device=device
+            )
+            slab = torch.full(
+                (int(level.cu_total_compress_token_nums[-1]),), -1.0, device=device
+            )
             for batch_idx in range(real_bs):
                 start = int(level.cu_total_compress_token_nums[batch_idx])
                 rows = packed[packed_cu[batch_idx] : packed_cu[batch_idx + 1]]
@@ -190,13 +233,17 @@ class TestVerifyGraphReplay(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 metadata.topk_cu_seqlens_q,
-                torch.arange(bs * num_draft_tokens + 1, dtype=torch.int32),
+                torch.arange(
+                    bs * num_draft_tokens + 1, dtype=torch.int32, device=DEVICE
+                ),
             )
         )
         self.assertTrue(
             torch.equal(
                 metadata.cu_seqlens_q_adjusted,
-                torch.arange(bs * num_draft_tokens + 1, dtype=torch.int32)
+                torch.arange(
+                    bs * num_draft_tokens + 1, dtype=torch.int32, device=DEVICE
+                )
                 * backend.heads_per_group,
             )
         )
@@ -222,7 +269,7 @@ class TestVerifyGraphReplay(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 level.cu_total_compress_token_nums,
-                torch.arange(bs + 1, dtype=torch.int32)
+                torch.arange(bs + 1, dtype=torch.int32, device=DEVICE)
                 * (backend.max_context_len // kernel_stride),
             ),
             name,
@@ -257,7 +304,7 @@ class TestVerifyGraphReplay(CustomTestCase):
         # num_kv_heads=2 makes sparse_rows outnumber the verify tokens, so
         # the row-width and token-width binds below cannot swap silently.
         backend, base = make_replay_backend(
-            [1, 1], num_draft_tokens, num_kv_heads=2, max_bs=2
+            [1, 1], num_draft_tokens, num_kv_heads=2, max_bs=2, device=DEVICE
         )
         metadata, forward_batch = _capture_seed(backend, base, bs=2)
         self.assertTrue((metadata.sparse_cache_seqlens_int32 > 0).all())
@@ -276,7 +323,7 @@ class TestVerifyGraphReplay(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 base.cu_seqlens_k,
-                torch.arange(3, dtype=torch.int32) * assume_kv_len,
+                torch.arange(3, dtype=torch.int32, device=DEVICE) * assume_kv_len,
             )
         )
         # Magnitude pin:
@@ -287,7 +334,9 @@ class TestVerifyGraphReplay(CustomTestCase):
         # The decode-form selection geometry the captured plan freezes:
         # prefix-stable arange buffers bound at their verify-width slice,
         # with the head-group expansion applied to the adjusted one.
-        arange = torch.arange(2 * num_draft_tokens + 1, dtype=torch.int32)
+        arange = torch.arange(
+            2 * num_draft_tokens + 1, dtype=torch.int32, device=DEVICE
+        )
         self.assertTrue(torch.equal(metadata.topk_cu_seqlens_q, arange))
         self.assertTrue(
             torch.equal(
@@ -306,7 +355,7 @@ class TestVerifyGraphReplay(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 metadata.sparse_cu_seqlens_q,
-                torch.arange(sparse_rows + 1, dtype=torch.int32),
+                torch.arange(sparse_rows + 1, dtype=torch.int32, device=DEVICE),
             )
         )
 
@@ -316,7 +365,9 @@ class TestVerifyGraphReplay(CustomTestCase):
         never per-capture allocations."""
         num_draft_tokens = 2
         bs = 2
-        backend, base = make_replay_backend([1] * bs, num_draft_tokens, max_bs=4)
+        backend, base = make_replay_backend(
+            [1] * bs, num_draft_tokens, max_bs=4, device=DEVICE
+        )
         metadata, _ = _capture_seed(backend, base, bs=bs)
         for name in ("k1", "k2"):
             layout = getattr(metadata, f"{name}_repeat")
@@ -340,7 +391,9 @@ class TestVerifyGraphReplay(CustomTestCase):
                 return_value=None,
             ),
         ):
-            backend, base = make_replay_backend([1, 1], num_draft_tokens, max_bs=4)
+            backend, base = make_replay_backend(
+                [1, 1], num_draft_tokens, max_bs=4, device=DEVICE
+            )
             metadata = MiniCPMSparseMetadata(base=base)
             backend._bind_sparse_verify_graph_metadata(
                 SimpleNamespace(batch_size=2, spec_info=None),
@@ -360,11 +413,13 @@ class TestVerifyGraphReplay(CustomTestCase):
         so the compression view sized from cu_seqlens_cpu must cover the slab
         -- a dense-window seed lets the captured index_select read past the view."""
         num_draft_tokens = 2
-        backend, base = make_replay_backend([1] * 4, num_draft_tokens, max_bs=4)
+        backend, base = make_replay_backend(
+            [1] * 4, num_draft_tokens, max_bs=4, device=DEVICE
+        )
         _capture_seed(backend, base, bs=4)
         # A smaller capture reuses the retained index after a larger one wrote
         # it; the gather reads the whole smaller view, tail included.
-        _, small_base = make_verify_batch([1, 1], num_draft_tokens)
+        _, small_base = make_verify_batch([1, 1], num_draft_tokens, device=DEVICE)
         small_base.max_seq_len_q = num_draft_tokens
         metadata, _ = _capture_seed(backend, small_base, bs=2)
         for name in ("k1", "k2"):
@@ -384,7 +439,9 @@ class TestVerifyGraphReplay(CustomTestCase):
         real_seq_lens = [100, 130, 126, 190]
         padded_seq_lens = [*real_seq_lens, 1]
         bs, real_bs = len(padded_seq_lens), len(real_seq_lens)
-        backend, base = make_replay_backend(padded_seq_lens, num_draft_tokens, max_bs=5)
+        backend, base = make_replay_backend(
+            padded_seq_lens, num_draft_tokens, max_bs=5, device=DEVICE
+        )
         head_group_num = backend.head_group_num
 
         capture_batch = SimpleNamespace(batch_size=bs, spec_info=None)
@@ -394,7 +451,8 @@ class TestVerifyGraphReplay(CustomTestCase):
         # The FlashAttention replay refreshes the base buffers;
         # the capture seeding overwrote them.
         base.cache_seqlens_int32.copy_(
-            torch.tensor(padded_seq_lens, dtype=torch.int32) + num_draft_tokens
+            torch.tensor(padded_seq_lens, dtype=torch.int32, device=DEVICE)
+            + num_draft_tokens
         )
         base.cu_seqlens_k.copy_(
             F.pad(
@@ -409,7 +467,7 @@ class TestVerifyGraphReplay(CustomTestCase):
             bs=bs,
             real_bs=real_bs,
             padded_seq_lens=padded_seq_lens,
-            req_pool_indices=torch.tensor([2, 5, 1, 4, 0]),
+            req_pool_indices=torch.tensor([2, 5, 1, 4, 0], device=DEVICE),
             spec_info=None,
         )
 
@@ -470,7 +528,9 @@ class TestVerifyGraphReplay(CustomTestCase):
         keeps the capture-time slab offsets the compression kernel writes at."""
         num_draft_tokens = 2
         bs = 2
-        backend, base = make_replay_backend([1] * bs, num_draft_tokens, max_bs=bs)
+        backend, base = make_replay_backend(
+            [1] * bs, num_draft_tokens, max_bs=bs, device=DEVICE
+        )
         backend._bind_sparse_verify_graph_metadata(
             SimpleNamespace(batch_size=bs, spec_info=None),
             MiniCPMSparseMetadata(base=base),
@@ -479,9 +539,9 @@ class TestVerifyGraphReplay(CustomTestCase):
         forward_batch = SimpleNamespace(
             batch_size=bs,
             num_padding=bs,
-            seq_lens=torch.ones(bs, dtype=torch.int32),
+            seq_lens=torch.ones(bs, dtype=torch.int32, device=DEVICE),
             seq_lens_cpu=torch.ones(bs, dtype=torch.int32),
-            req_pool_indices=torch.arange(bs, dtype=torch.int64),
+            req_pool_indices=torch.arange(bs, dtype=torch.int64, device=DEVICE),
             spec_info=None,
         )
         metadata = MiniCPMSparseMetadata(base=base)
@@ -526,6 +586,125 @@ class TestVerifyGraphReplay(CustomTestCase):
             self.assertTrue(
                 (repeat.cu_seqlens[: bs * num_draft_tokens + 1] == 0).all(), name
             )
+
+    def test_graph_tree_capture_seeds_chain_degenerate_plan(self):
+        """Tree capture must seed an all-True square
+        so the seeded plan rows equal the chain closed form."""
+        num_draft_tokens = 2
+        backend, base = make_replay_backend(
+            [1, 1], num_draft_tokens, max_bs=2, eagle_topk=2, device=DEVICE
+        )
+        # Dirty the static mask as a previous replay would.
+        backend.decode_cuda_graph_metadata["verify_draft_tree_mask"].fill_(False)
+        metadata, _ = _capture_seed(backend, base, bs=2)
+        self.assertTrue(metadata.verify_draft_tree_mask.all())
+        chain_rows = _capture_seed_chain_rows(backend, num_draft_tokens)
+        self.assertTrue(torch.equal(metadata.sparse_cache_seqlens_int32, chain_rows))
+        self.assertTrue(torch.equal(metadata.verify_source_row_lens, chain_rows))
+
+    def test_graph_tree_replay_matches_eager_tree_builder(self):
+        """Tree replay must match the eager tree builder: popcount row lengths,
+        chain source lengths, base geometry rebuilt in place,
+        reuse boundary rolled back by num_draft_tokens."""
+        num_draft_tokens = 3
+        # 200 clamps every draft row past the sparse capacity;
+        # the other two stay in the identity regime.
+        real_seq_lens = [100, 130, 200]
+        padded_seq_lens = [*real_seq_lens, 1]
+        bs, real_bs = len(padded_seq_lens), len(real_seq_lens)
+        backend, base = make_replay_backend(
+            padded_seq_lens, num_draft_tokens, max_bs=4, eagle_topk=2, device=DEVICE
+        )
+        head_group_num = backend.head_group_num
+        # Node 2 hides node 1 in both real requests.
+        square = tree_mask_from_parents([-1, 0, 0])
+        squares = [square] * real_bs
+        custom_mask = pack_custom_mask(real_seq_lens, squares, device=DEVICE)
+
+        capture_batch = SimpleNamespace(batch_size=bs, spec_info=None)
+        backend._bind_sparse_verify_graph_metadata(
+            capture_batch, MiniCPMSparseMetadata(base=base), in_capture=True
+        )
+        # FA's topk>1 replay refresh leaves the two-phase tree layout in the
+        # static base buffers: prefix-only cache lengths and page-table rows.
+        prefix = torch.tensor(padded_seq_lens, dtype=torch.int32, device=DEVICE)
+        base.cache_seqlens_int32.copy_(prefix)
+        base.cu_seqlens_k.copy_(
+            F.pad(torch.cumsum(prefix, dim=0, dtype=torch.int32), (1, 0))
+        )
+        base.page_table.zero_()
+
+        forward_batch, metadata = _replay_verify_graph(
+            backend,
+            base,
+            bs=bs,
+            real_bs=real_bs,
+            padded_seq_lens=padded_seq_lens,
+            req_pool_indices=torch.tensor([2, 5, 1, 4], device=DEVICE),
+            spec_info=SimpleNamespace(custom_mask=custom_mask),
+        )
+
+        self._assert_replay_rebuilds_base_geometry(
+            backend=backend,
+            base=base,
+            forward_batch=forward_batch,
+            padded_seq_lens=padded_seq_lens,
+            num_draft_tokens=num_draft_tokens,
+        )
+
+        staged = metadata.verify_draft_tree_mask.view(
+            bs, num_draft_tokens, num_draft_tokens
+        )
+        for b in range(real_bs):
+            self.assertTrue(torch.equal(staged[b].cpu(), square), b)
+        self.assertTrue(staged[real_bs:].all())
+
+        counts = visible_counts(
+            mask=metadata.verify_draft_tree_mask[
+                : real_bs * num_draft_tokens * num_draft_tokens
+            ],
+            bs=real_bs,
+            num_draft_tokens=num_draft_tokens,
+        )
+        eager = _eager_verify(
+            backend,
+            seq_lens=real_seq_lens,
+            num_draft_tokens=num_draft_tokens,
+            num_draft_visible=counts,
+        )
+        real_rows, row_lens = self._assert_replay_rows(
+            metadata=metadata,
+            eager=eager,
+            real_bs=real_bs,
+            num_draft_tokens=num_draft_tokens,
+            head_group_num=head_group_num,
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.verify_source_row_lens[:real_rows],
+                eager.verify_source_row_lens,
+            )
+        )
+        self.assertTrue((metadata.verify_source_row_lens[real_rows:] == 0).all())
+        self.assertTrue(
+            torch.equal(
+                metadata.verify_prefix_lens,
+                torch.tensor(padded_seq_lens, dtype=torch.int32, device=DEVICE),
+            )
+        )
+        self._assert_row_lens_cumsum(metadata, row_lens)
+        # The tree reuse boundary rolls back by num_draft_tokens (keys moved).
+        eager_levels = self._assert_level_buffers_match_eager_builder(
+            backend,
+            metadata,
+            forward_batch,
+            real_seq_lens,
+            num_draft_tokens,
+            history_lens=torch.tensor(real_seq_lens, device=DEVICE) - num_draft_tokens,
+        )
+        self._assert_repeat_layouts_match_eager(
+            backend, metadata, eager_levels, real_bs, num_draft_tokens
+        )
 
 
 if __name__ == "__main__":
