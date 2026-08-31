@@ -7,6 +7,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.minicpm_fixtures import (
+    make_verify_batch,
     pack_custom_mask,
     tree_mask_from_parents,
     visible_counts,
@@ -38,26 +39,8 @@ NUM_DRAFT_TOKENS = 3
 
 
 def _verify_metadata(seq_lens, draft_visible, dense_len):
-    bs = len(seq_lens)
-    seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
-    cache_seqlens = (seq_lens_cpu + NUM_DRAFT_TOKENS).to(DEVICE)
-    forward_batch = SimpleNamespace(
-        batch_size=bs,
-        seq_lens=seq_lens_cpu.to(DEVICE),
-        seq_lens_cpu=seq_lens_cpu,
-    )
-    base_metadata = SimpleNamespace(
-        cache_seqlens_int32=cache_seqlens,
-        max_seq_len_k=int(cache_seqlens.max()),
-        cu_seqlens_q=torch.arange(
-            0, bs * NUM_DRAFT_TOKENS + 1, NUM_DRAFT_TOKENS, dtype=torch.int32
-        ).to(DEVICE),
-        cu_seqlens_k=torch.nn.functional.pad(
-            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
-        ),
-        page_table=torch.zeros((bs, int(cache_seqlens.max())), dtype=torch.int32).to(
-            DEVICE
-        ),
+    forward_batch, base_metadata = make_verify_batch(
+        seq_lens, NUM_DRAFT_TOKENS, device=DEVICE
     )
     metadata = MiniCPMSparseMetadata(base=base_metadata)
     _plan_sparse_verify(
@@ -392,12 +375,10 @@ class TestTreeVerifyRecompression(CustomTestCase):
             k1, _ = _build_k1_k2_compression_metadata(
                 req_pool_indices=forward_batch.req_pool_indices,
                 base_metadata=base_metadata,
-                req_to_sparse_k1_token=req_to_sparse,
-                req_to_sparse_k2_token=req_to_sparse,
-                k1_kernel_size=kernel_size,
-                k1_kernel_stride=kernel_stride,
-                k2_kernel_size=kernel_size * 4,
-                k2_kernel_stride=kernel_stride * 4,
+                levels=(
+                    ("k1", kernel_size, kernel_stride, req_to_sparse),
+                    ("k2", kernel_size * 4, kernel_stride * 4, req_to_sparse),
+                ),
                 seq_lens_cpu=forward_batch.seq_lens_cpu + num_draft_tokens,
                 history_lens=history_lens,
             )

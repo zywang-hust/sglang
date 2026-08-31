@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -501,4 +503,181 @@ def fill_dense_page_table_rows(
         BLOCK_N=1024,
         BLOCK_D=triton.next_power_of_2(num_draft_tokens),
         num_warps=8,
+    )
+
+
+@triton.jit
+def _verify_replay_metadata_kernel(
+    seq_lens_ptr,  # int [bs] prefix seq lens (any int dtype)
+    # int32 [bs*num_draft_tokens] causal-visible draft counts (HAS_TREE)
+    num_visible_ptr,
+    token_pos_ptr,  # int32 [bs*num_draft_tokens] out: causal position per token
+    stage1_ptr,  # int32 [bs*num_draft_tokens] out: token_pos - 1 (selection lens)
+    prefix_lens_ptr,  # int32 [bs] out: int32 copy of seq_lens (HAS_TREE)
+    row_lens_ptr,  # int32 [rows] out: planned per-row KV counts
+    source_lens_ptr,  # int32 [rows] out: chain-form fill bound (HAS_TREE)
+    cu_seqlens_k_ptr,  # int32 [rows+1] out: [1:] = cumsum(row lens)
+    dense_len,
+    sparse_topk,
+    block_size,
+    real_rows,  # rows past this store 0 (CUDA-graph padding)
+    bs,
+    num_draft_tokens: tl.constexpr,
+    head_group_num: tl.constexpr,
+    HAS_TREE: tl.constexpr,
+    BLOCK: tl.constexpr,  # >= rows = bs * num_draft_tokens * head_group_num
+):
+    # Must stay in sync with _build_sparse_verify_rows and _plan_sparse_verify;
+    # the clamp inlines _get_sparse_cache_lens.
+    offs = tl.arange(0, BLOCK)
+    rows = bs * num_draft_tokens * head_group_num
+    num_tokens = bs * num_draft_tokens
+    row_mask = offs < rows
+
+    token = offs // head_group_num
+    off = token % num_draft_tokens + 1
+    seq = tl.load(seq_lens_ptr + token // num_draft_tokens, mask=row_mask, other=0).to(
+        tl.int32
+    )
+    token_pos = seq + off
+
+    budget = sparse_topk * block_size
+    mod = token_pos % block_size
+    capped = tl.where(mod == 0, budget, (sparse_topk - 1) * block_size + mod)
+    sc = tl.where((token_pos <= budget) | (token_pos < dense_len), token_pos, capped)
+
+    if HAS_TREE:
+        visible = tl.load(num_visible_ptr + token, mask=row_mask, other=0)
+        row_lens = sc - off + visible
+    else:
+        row_lens = sc
+
+    live = offs < real_rows
+    row_lens = tl.where(live, row_lens, 0)
+    tl.store(row_lens_ptr + offs, row_lens, mask=row_mask)
+    tl.store(cu_seqlens_k_ptr + 1 + offs, tl.cumsum(row_lens, axis=0), mask=row_mask)
+    if HAS_TREE:
+        tl.store(source_lens_ptr + offs, tl.where(live, sc, 0), mask=row_mask)
+
+    t_mask = offs < num_tokens
+    t_seq = tl.load(seq_lens_ptr + offs // num_draft_tokens, mask=t_mask, other=0).to(
+        tl.int32
+    )
+    t_pos = t_seq + offs % num_draft_tokens + 1
+    tl.store(token_pos_ptr + offs, t_pos, mask=t_mask)
+    tl.store(stage1_ptr + offs, t_pos - 1, mask=t_mask)
+    if HAS_TREE:
+        b_mask = offs < bs
+        prefix = tl.load(seq_lens_ptr + offs, mask=b_mask, other=0).to(tl.int32)
+        tl.store(prefix_lens_ptr + offs, prefix, mask=b_mask)
+
+
+def fill_verify_replay_metadata(
+    seq_lens: torch.Tensor,
+    *,
+    num_visible: Optional[torch.Tensor],
+    token_pos_out: torch.Tensor,
+    stage1_out: torch.Tensor,
+    prefix_lens_out: Optional[torch.Tensor],
+    row_lens_out: torch.Tensor,
+    source_lens_out: Optional[torch.Tensor],
+    cu_seqlens_k_out: torch.Tensor,
+    dense_len: int,
+    sparse_topk: int,
+    block_size: int,
+    real_rows: int,
+    bs: int,
+    num_draft_tokens: int,
+    head_group_num: int,
+) -> None:
+    """Refresh every verify row buffer in one launch;
+    ``cu_seqlens_k_out[0]`` must be pre-zeroed.
+    ``num_visible`` None means chain drafts (the tree-only outputs are skipped)."""
+    rows = bs * num_draft_tokens * head_group_num
+    _verify_replay_metadata_kernel[(1,)](
+        seq_lens,
+        num_visible,
+        token_pos_out,
+        stage1_out,
+        prefix_lens_out,
+        row_lens_out,
+        source_lens_out,
+        cu_seqlens_k_out,
+        dense_len,
+        sparse_topk,
+        block_size,
+        real_rows,
+        bs,
+        num_draft_tokens=num_draft_tokens,
+        head_group_num=head_group_num,
+        HAS_TREE=num_visible is not None,
+        BLOCK=triton.next_power_of_2(rows),
+    )
+
+
+@triton.jit
+def _compress_level_metadata_kernel(
+    seq_lens_ptr,  # int   [>= real_bs] raw seq lens
+    history_ptr,  # int32 [bs]   out: history_compress_token_nums
+    cu_seqlens_ptr,  # int32 [bs+1] out: cumsum(seq_lens_k) into [1:bs+1]
+    cu_new_token_ptr,  # int32 [bs+1] out: cumsum(new_token_nums) into [1:bs+1]
+    full_delta,
+    prefix_delta,  # int  reuse boundary = seq_len + prefix_delta
+    kernel_size,
+    kernel_stride,
+    real_bs,
+    bs,  # int  (padded) batch size
+    BLOCK: tl.constexpr,
+):
+    # Device mirror of _compute_single_compression_metadata for captured verify replay.
+    offs = tl.arange(0, BLOCK)
+    mask = offs < bs
+    live = offs < real_bs
+    raw = tl.load(seq_lens_ptr + offs, mask=live, other=0).to(tl.int32)
+    full = raw + full_delta
+    prefix = raw + prefix_delta
+
+    t = full - kernel_size
+    # Truncating division equals torch floor-div + clamp(min=0) only for t >= 0.
+    seq_lens_k = tl.where(t >= 0, t // kernel_stride + 1, 0)
+    t = prefix - kernel_size
+    history = tl.where(t >= 0, t // kernel_stride + 1, 0)
+    new_token = full - history * kernel_stride
+
+    seq_lens_k = tl.where(live, seq_lens_k, 0)
+    history = tl.where(live, history, 0)
+    new_token = tl.where(live, new_token, 0)
+
+    tl.store(history_ptr + offs, history, mask=mask)
+    tl.store(cu_seqlens_ptr + 1 + offs, tl.cumsum(seq_lens_k, axis=0), mask=mask)
+    tl.store(cu_new_token_ptr + 1 + offs, tl.cumsum(new_token, axis=0), mask=mask)
+
+
+def fill_compress_level_metadata(
+    seq_lens: torch.Tensor,
+    *,
+    history_out: torch.Tensor,
+    cu_seqlens_out: torch.Tensor,
+    cu_new_token_out: torch.Tensor,
+    full_delta: int,
+    prefix_delta: int,
+    kernel_size: int,
+    kernel_stride: int,
+    real_bs: int,
+    bs: int,
+) -> None:
+    """Fill one compression level's verify replay buffers in one launch;
+    ``cu_*_out[0]`` must be pre-zeroed."""
+    _compress_level_metadata_kernel[(1,)](
+        seq_lens,
+        history_out,
+        cu_seqlens_out,
+        cu_new_token_out,
+        full_delta,
+        prefix_delta,
+        kernel_size,
+        kernel_stride,
+        real_bs,
+        bs,
+        BLOCK=triton.next_power_of_2(bs),
     )

@@ -204,12 +204,11 @@ class MiniCPMFlashInferAdapter:
                 fixed_split_size=self.flashinfer_backend.prefill_split_tile_size,
             )
         else:
-            kv_indptr = self.kv_indptr[: sparse_bs + 1]
-            kv_indptr[0] = 0
-            torch.cumsum(cache_seqlens, dim=0, out=kv_indptr[1:])
+            # sparse_cu_seqlens_k is the cache_seqlens cumsum on every non-prefill path.
+            kv_indptr = metadata.sparse_cu_seqlens_k
             kv_indices = self.kv_indices[: sparse_bs * self.max_kv_tokens_per_row]
             kv_last_page_len = self.kv_last_page_len[:sparse_bs]
-            kv_last_page_len.copy_((cache_seqlens > 0).to(torch.int32))
+            torch.clamp(cache_seqlens, min=0, max=1, out=kv_last_page_len)
             rows = self.rows[:sparse_bs]
             if graph:
                 graph_bs = sparse_bs // self.head_group_num

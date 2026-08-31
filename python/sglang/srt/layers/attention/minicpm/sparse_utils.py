@@ -569,13 +569,9 @@ def _compute_single_compression_metadata(
 def _build_k1_k2_compression_metadata(
     req_pool_indices: torch.Tensor,
     base_metadata: FlashAttentionMetadata,
-    req_to_sparse_k1_token: torch.Tensor,
-    req_to_sparse_k2_token: torch.Tensor,
-    k1_kernel_size: int,
-    k1_kernel_stride: int,
-    k2_kernel_size: int,
-    k2_kernel_stride: int,
     seq_lens_cpu: torch.Tensor,
+    *,
+    levels,
     history_lens: Optional[torch.Tensor] = None,
 ) -> tuple[CompressionLevelMetadata, CompressionLevelMetadata]:
     seq_lens_cpu = torch.as_tensor(
@@ -606,10 +602,7 @@ def _build_k1_k2_compression_metadata(
             kernel_size,
             kernel_stride,
         )
-        for req_to_sparse_token, kernel_size, kernel_stride in (
-            (req_to_sparse_k1_token, k1_kernel_size, k1_kernel_stride),
-            (req_to_sparse_k2_token, k2_kernel_size, k2_kernel_stride),
-        )
+        for _, kernel_size, kernel_stride, req_to_sparse_token in levels
     )
 
 
@@ -640,23 +633,15 @@ def _plan_dense_rows(
     ]
 
 
-def _build_sparse_verify_replay_rows(
+def _build_sparse_verify_rows(
     seq_lens: torch.Tensor,
+    *,
     head_group_num: int,
     dense_len: int,
     sparse_topk: int,
     block_size: int,
     num_draft_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chain-form verify rows in device closed form, sync-free.
-
-    Returns ``(token_pos, row_lens)``: causal positions
-    ``(bs * num_draft_tokens,)`` and per-(token, head group) row lengths
-    ``(bs * num_draft_tokens * head_group_num,)``. Row lengths follow the
-    ``_plan_sparse_verify`` rule -- ``token_pos`` for dense rows, the
-    ``_get_sparse_cache_lens`` clamp otherwise -- inlined here for the
-    arange layout.
-    """
     device = seq_lens.device
     sparse_capacity = sparse_topk * block_size
     offsets = torch.arange(1, num_draft_tokens + 1, dtype=torch.int32, device=device)
@@ -919,7 +904,7 @@ def _plan_sparse_verify(
         bs * num_draft_tokens + 1, dtype=torch.int32, device=device
     )
 
-    token_pos_in_bs, source_row_lens = _build_sparse_verify_replay_rows(
+    token_pos_in_bs, source_row_lens = _build_sparse_verify_rows(
         forward_batch.seq_lens,
         head_group_num=head_group_num,
         dense_len=dense_len,

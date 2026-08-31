@@ -610,12 +610,10 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
 
     def test_mixed_prefill_compacts_stage1_cache_lengths(self):
         backend = MiniCPMSparseBackend.__new__(MiniCPMSparseBackend)
-        backend.req_to_sparse_k1_token = torch.empty(0)
-        backend.req_to_sparse_k2_token = torch.empty(0)
-        backend.k1_kernel_size = 32
-        backend.k1_kernel_stride = 16
-        backend.k2_kernel_size = 128
-        backend.k2_kernel_stride = 64
+        backend.compress_levels = (
+            ("k1", 32, 16, torch.empty(0)),
+            ("k2", 128, 64, torch.empty(0)),
+        )
         backend.dense_len = 100
         backend.head_group_num = 1
         backend.sparse_topk = 2
@@ -1360,12 +1358,20 @@ import sglang.srt.layers.attention.minicpm.backend
         k1, k2 = sparse_utils._build_k1_k2_compression_metadata(
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
             base_metadata=base_metadata,
-            req_to_sparse_k1_token=req_to_sparse_token,
-            req_to_sparse_k2_token=req_to_sparse_token,
-            k1_kernel_size=config.k1_kernel_size,
-            k1_kernel_stride=config.k1_kernel_stride,
-            k2_kernel_size=config.k2_kernel_size,
-            k2_kernel_stride=config.k2_kernel_stride,
+            levels=(
+                (
+                    "k1",
+                    config.k1_kernel_size,
+                    config.k1_kernel_stride,
+                    req_to_sparse_token,
+                ),
+                (
+                    "k2",
+                    config.k2_kernel_size,
+                    config.k2_kernel_stride,
+                    req_to_sparse_token,
+                ),
+            ),
             seq_lens_cpu=_SingleTensorConversion([100, 200, 300]),
         )
 
@@ -1381,10 +1387,10 @@ import sglang.srt.layers.attention.minicpm.backend
         backend = MiniCPMSparseBackend.__new__(MiniCPMSparseBackend)
         backend.head_group_num = 2
         backend.max_context_len = 8
-        backend.k1_kernel_stride = 2
-        backend.k2_kernel_stride = 4
-        backend.req_to_sparse_k1_token = torch.arange(8).reshape(4, 2)
-        backend.req_to_sparse_k2_token = torch.arange(8).reshape(4, 2)
+        backend.compress_levels = (
+            ("k1", 2, 2, torch.arange(8).reshape(4, 2)),
+            ("k2", 4, 4, torch.arange(8).reshape(4, 2)),
+        )
         backend.decode_cuda_graph_metadata = {
             "compress_k1": torch.empty(16, 1, 1),
             "compress_k2": torch.empty(8, 1, 1),
@@ -1472,10 +1478,10 @@ import sglang.srt.layers.attention.minicpm.backend
         backend = MiniCPMSparseBackend.__new__(MiniCPMSparseBackend)
         backend.head_group_num = 2
         backend.max_context_len = 8
-        backend.k1_kernel_stride = 2
-        backend.k2_kernel_stride = 4
-        backend.req_to_sparse_k1_token = torch.arange(8).reshape(4, 2)
-        backend.req_to_sparse_k2_token = torch.arange(8).reshape(4, 2)
+        backend.compress_levels = (
+            ("k1", 2, 2, torch.arange(8).reshape(4, 2)),
+            ("k2", 4, 4, torch.arange(8).reshape(4, 2)),
+        )
         backend.decode_cuda_graph_metadata = {
             "compress_k1": torch.empty(16, 1, 1),
             "compress_k2": torch.empty(8, 1, 1),
@@ -1574,21 +1580,14 @@ import sglang.srt.layers.attention.minicpm.backend
         backend.dense_len = 5
         backend.sparse_topk = 2
         backend.block_size = 4
-        backend.k1_kernel_size = 4
-        backend.k1_kernel_stride = 2
-        backend.k2_kernel_size = 8
-        backend.k2_kernel_stride = 4
-        backend.req_to_sparse_k1_token = torch.arange(8).reshape(4, 2)
-        backend.req_to_sparse_k2_token = torch.arange(8).reshape(4, 2)
+        backend.compress_levels = ()
+        backend._replay_compression_graph_metadata = Mock()
         # Live lens [3, 9, 1] plus one padded request: only request 1 is sparse.
         metadata = sparse_utils.MiniCPMSparseMetadata(
             base=SimpleNamespace(
                 cache_seqlens_int32=torch.tensor([3, 9, 1, 0], dtype=torch.int32),
-                cu_seqlens_q=torch.arange(5, dtype=torch.int32),
                 page_table=torch.zeros((4, 8), dtype=torch.int32),
             ),
-            k1=_graph_replay_graph_level(),
-            k2=_graph_replay_graph_level(),
             sparse_cache_seqlens_int32=torch.zeros(8, dtype=torch.int32),
             sparse_cu_seqlens_k=torch.zeros(9, dtype=torch.int32),
             cache_seqlens_int32_stage1=torch.zeros(4, dtype=torch.int32),
@@ -1605,10 +1604,7 @@ import sglang.srt.layers.attention.minicpm.backend
         with patch.object(
             backend_module,
             "_build_k1_k2_compression_metadata",
-            return_value=(
-                _graph_replay_level([1, 2, 3], [0, 1, 3, 6]),
-                _graph_replay_level([4, 5, 6], [0, 4, 9, 15]),
-            ),
+            return_value=(None, None),
         ):
             backend._replay_sparse_graph_metadata(forward_batch, metadata)
 

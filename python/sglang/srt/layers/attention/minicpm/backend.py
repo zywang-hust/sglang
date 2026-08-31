@@ -25,7 +25,9 @@ from sglang.srt.layers.attention.minicpm.cache import attach_compressed_cache
 from sglang.srt.layers.attention.minicpm.sparse_kernels import (
     compact_sparse_tree_page_table,
     copy_eagle_draft_tree_mask,
+    fill_compress_level_metadata,
     fill_dense_page_table_rows,
+    fill_verify_replay_metadata,
 )
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     CompressionLevelMetadata,
@@ -35,7 +37,6 @@ from sglang.srt.layers.attention.minicpm.sparse_utils import (
     _build_dense_verify_overwrite,
     _build_k1_k2_compression_metadata,
     _build_sparse_decode_metadata,
-    _build_sparse_verify_replay_rows,
     _build_tree_verify_base_geometry,
     _plan_repeated_segments,
     _plan_sparse_decode,
@@ -257,12 +258,20 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.k1_kernel_stride = self.kernel_stride
         self.k2_kernel_size = self.kernel_size * 4
         self.k2_kernel_stride = self.kernel_stride * 4
+        self._init_compress_levels()
 
         self._init_spec_decode_config(model_runner.server_args)
 
         self.minicpm_fuse_topk = (
             use_blackwell and use_flashinfer
         ) or envs.SGLANG_MINICPM_FUSE_TOPK.get()
+        # The fused top-k scores on the k1 level alone,
+        # so the k2 repeat layout has no readers under minicpm_fuse_topk.
+        self.verify_repeat_levels = frozenset(
+            name
+            for name, _, _, _ in self.compress_levels
+            if name != "k2" or not self.minicpm_fuse_topk
+        )
         dtype_str = str(self.model_dtype).removeprefix("torch.")
         if self.minicpm_fuse_topk and dtype_str not in ("bfloat16", "float16"):
             raise ValueError(
@@ -356,6 +365,25 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.speculative_eagle_topk = (
             (server_args.speculative_eagle_topk or 1) if spec_on else 1
         )
+        self.verify_reuse_prefix_delta = (
+            -self.speculative_num_draft_tokens if self.speculative_eagle_topk > 1 else 0
+        )
+
+    def _init_compress_levels(self):
+        self.compress_levels = (
+            (
+                "k1",
+                self.k1_kernel_size,
+                self.k1_kernel_stride,
+                self.req_to_sparse_k1_token,
+            ),
+            (
+                "k2",
+                self.k2_kernel_size,
+                self.k2_kernel_stride,
+                self.req_to_sparse_k2_token,
+            ),
+        )
 
     def _get_fused_topk_kernel(self, batch_size: int, *, is_prefill: bool):
         if not self.minicpm_fuse_topk:
@@ -386,12 +414,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         metadata.k1, metadata.k2 = _build_k1_k2_compression_metadata(
             req_pool_indices=forward_batch.req_pool_indices,
             base_metadata=metadata.base,
-            req_to_sparse_k1_token=self.req_to_sparse_k1_token,
-            req_to_sparse_k2_token=self.req_to_sparse_k2_token,
-            k1_kernel_size=self.k1_kernel_size,
-            k1_kernel_stride=self.k1_kernel_stride,
-            k2_kernel_size=self.k2_kernel_size,
-            k2_kernel_stride=self.k2_kernel_stride,
+            levels=self.compress_levels,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
@@ -442,12 +465,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         metadata.k1, metadata.k2 = _build_k1_k2_compression_metadata(
             req_pool_indices=forward_batch.req_pool_indices,
             base_metadata=metadata.base,
-            req_to_sparse_k1_token=self.req_to_sparse_k1_token,
-            req_to_sparse_k2_token=self.req_to_sparse_k2_token,
-            k1_kernel_size=self.k1_kernel_size,
-            k1_kernel_stride=self.k1_kernel_stride,
-            k2_kernel_size=self.k2_kernel_size,
-            k2_kernel_stride=self.k2_kernel_stride,
+            levels=self.compress_levels,
             seq_lens_cpu=forward_batch.seq_lens_cpu + num_draft_tokens,
             history_lens=history_lens,
         )
@@ -468,9 +486,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             total_tokens=metadata.k1.cu_seqlens_cpu[-1],
             repeats=num_draft_tokens,
         )
-        # The fused top-k scores on the k1 level alone,
-        # so the k2 repeat layout has no readers under minicpm_fuse_topk.
-        if not self.minicpm_fuse_topk:
+        if "k2" in self.verify_repeat_levels:
             metadata.k2_repeat = _plan_repeated_segments(
                 metadata.k2.cu_seqlens,
                 total_tokens=metadata.k2.cu_seqlens_cpu[-1],
@@ -1213,7 +1229,10 @@ class MiniCPMSparseBackend(AttentionBackend):
 
     def _init_verify_graph_buffers(self, max_bs: int, max_num_tokens: int):
         buffers = self.decode_cuda_graph_metadata
-        if self.speculative_num_draft_tokens is not None:
+        if (
+            self.speculative_num_draft_tokens is not None
+            and self.speculative_eagle_topk == 1
+        ):
             buffers["verify_dense_rows"] = torch.zeros(
                 max_num_tokens,
                 self.head_group_num,
@@ -1282,7 +1301,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 max_bs, dtype=torch.int32, device=self.device
             )
             if self.speculative_num_draft_tokens is not None and (
-                name != "k2" or not self.minicpm_fuse_topk
+                name in self.verify_repeat_levels
             ):
                 # The captured gather records this index's address;
                 # it must outlive the graphs (capture binds per-level prefix views).
@@ -1321,9 +1340,21 @@ class MiniCPMSparseBackend(AttentionBackend):
             num_selection_rows,
             is_prefill=False,
         )
-        self.flash_attn_backend.init_forward_metadata_out_graph(
-            forward_batch, in_capture
-        )
+        if is_target_verify and self.speculative_eagle_topk > 1 and not in_capture:
+            # Bind the per-bs struct FA registered at capture
+            # (views into its static graph buffers) and skip FA's tree replay fill:
+            # _replay_sparse_verify_graph_metadata rewrites that storage,
+            # and the expand half is read only by FA's own verify forward,
+            # which never runs here.
+            self.flash_attn_backend.forward_metadata = (
+                self.flash_attn_backend.target_verify_metadata_topk_normal[
+                    forward_batch.batch_size
+                ]
+            )
+        else:
+            self.flash_attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture
+            )
         metadata = MiniCPMSparseMetadata(base=self.flash_attn_backend.forward_metadata)
         if is_target_verify:
             self._bind_sparse_verify_graph_metadata(
@@ -1365,12 +1396,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         compression_metadata = _build_k1_k2_compression_metadata(
             req_pool_indices=req_pool_indices,
             base_metadata=metadata.base,
-            req_to_sparse_k1_token=self.req_to_sparse_k1_token,
-            req_to_sparse_k2_token=self.req_to_sparse_k2_token,
-            k1_kernel_size=self.k1_kernel_size,
-            k1_kernel_stride=self.k1_kernel_stride,
-            k2_kernel_size=self.k2_kernel_size,
-            k2_kernel_stride=self.k2_kernel_stride,
+            levels=self.compress_levels,
             seq_lens_cpu=seq_lens_cpu,
         )
         return decode_metadata, compression_metadata
@@ -1540,19 +1566,15 @@ class MiniCPMSparseBackend(AttentionBackend):
         metadata: MiniCPMSparseMetadata,
         compression_metadata,
         real_bs: int,
-        cu_fields: tuple[str, ...] = (
+    ):
+        bs = forward_batch.batch_size
+        cu_fields = (
             "cu_seqlens",
             "cu_new_token_nums",
             "cu_total_compress_token_nums",
-        ),
-    ):
-        bs = forward_batch.batch_size
-        for (name, req_to_sparse), src in zip(
-            (
-                ("k1", self.req_to_sparse_k1_token),
-                ("k2", self.req_to_sparse_k2_token),
-            ),
-            compression_metadata,
+        )
+        for (name, _, _, req_to_sparse), src in zip(
+            self.compress_levels, compression_metadata
         ):
             dst = getattr(metadata, name)
             dst.history_compress_token_nums[:real_bs].copy_(
@@ -1568,7 +1590,41 @@ class MiniCPMSparseBackend(AttentionBackend):
                     # Padded rows get zero-length tails
                     # so the captured gathers stay in bounds.
                     dst_field[real_bs + 1 :].fill_(src_field[-1])
-            dst.table.copy_(req_to_sparse[forward_batch.req_pool_indices])
+            torch.index_select(
+                req_to_sparse, 0, forward_batch.req_pool_indices, out=dst.table
+            )
+
+    def _refresh_verify_compression_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        metadata: MiniCPMSparseMetadata,
+        *,
+        real_bs: int,
+    ):
+        bs = forward_batch.batch_size
+        for name, kernel_size, kernel_stride, req_to_sparse in self.compress_levels:
+            if name in self.verify_repeat_levels:
+                # The captured gather reads each request's full segment_rows slab,
+                # so the slots this round's compression skips must read as unselectable.
+                self.decode_cuda_graph_metadata[f"compress_{name}"][
+                    : real_bs * self.max_context_len // kernel_stride
+                ].fill_(float("-inf"))
+            dst = getattr(metadata, name)
+            fill_compress_level_metadata(
+                seq_lens=forward_batch.seq_lens,
+                history_out=dst.history_compress_token_nums,
+                cu_seqlens_out=dst.cu_seqlens,
+                cu_new_token_out=dst.cu_new_token_nums,
+                full_delta=self.speculative_num_draft_tokens,
+                prefix_delta=self.verify_reuse_prefix_delta,
+                kernel_size=kernel_size,
+                kernel_stride=kernel_stride,
+                real_bs=real_bs,
+                bs=bs,
+            )
+            torch.index_select(
+                req_to_sparse, 0, forward_batch.req_pool_indices, out=dst.table
+            )
 
     def _bind_sparse_verify_graph_metadata(
         self,
@@ -1602,8 +1658,13 @@ class MiniCPMSparseBackend(AttentionBackend):
                         1, num_draft_tokens + 1, dtype=torch.int32, device=self.device
                     ).repeat(bs)
                 )
-        metadata.verify_dense_rows = buffers["verify_dense_rows"][:num_verify_tokens]
-        metadata.verify_dense_mask = buffers["verify_dense_mask"][:num_verify_tokens]
+        else:
+            metadata.verify_dense_rows = buffers["verify_dense_rows"][
+                :num_verify_tokens
+            ]
+            metadata.verify_dense_mask = buffers["verify_dense_mask"][
+                :num_verify_tokens
+            ]
         _assign_row_metadata(
             metadata,
             sparse_cache_seqlens_int32=buffers["sparse_cache_seqlens"][:sparse_rows],
@@ -1680,10 +1741,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         # A level's layout is the max-bs layout's prefix;
         # binding views of the retained buffers keeps replay's slab offsets uniform.
         buffers = self.decode_cuda_graph_metadata
-        for name, kernel_stride in (
-            ("k1", self.k1_kernel_stride),
-            ("k2", self.k2_kernel_stride),
-        ):
+        for name, _, kernel_stride, _ in self.compress_levels:
             segment_rows = self.max_context_len // kernel_stride
             getattr(metadata, name).cu_total_compress_token_nums.copy_(
                 torch.arange(bs + 1, device=self.device, dtype=torch.int32)
@@ -1694,11 +1752,9 @@ class MiniCPMSparseBackend(AttentionBackend):
             getattr(metadata, name).cu_seqlens_cpu = [
                 row * segment_rows for row in range(bs + 1)
             ]
-            # Mirror the eager planner: the k2 repeat layout has no
-            # readers under minicpm_fuse_topk, so binding leaves it
-            # unset there and the captured gather records the plain
-            # level cu_seqlens instead.
-            if name != "k2" or not self.minicpm_fuse_topk:
+            # Mirror the eager planner: under minicpm_fuse_topk the k2 repeat is unset,
+            # and the captured gather records the plain level cu_seqlens.
+            if name in self.verify_repeat_levels:
                 layout = buffers[f"{name}_repeat"]
                 setattr(
                     metadata,
@@ -1716,43 +1772,35 @@ class MiniCPMSparseBackend(AttentionBackend):
         *,
         real_rows: int,
     ):
-        num_draft_tokens = self.speculative_num_draft_tokens
-        token_pos, row_lens = _build_sparse_verify_replay_rows(
-            seq_lens,
-            head_group_num=self.head_group_num,
+        fill_verify_replay_metadata(
+            seq_lens=seq_lens,
+            num_visible=metadata.verify_num_visible,
+            token_pos_out=metadata.token_pos_in_bs,
+            stage1_out=metadata.cache_seqlens_int32_stage1,
+            prefix_lens_out=metadata.verify_prefix_lens,
+            row_lens_out=metadata.sparse_cache_seqlens_int32,
+            source_lens_out=metadata.verify_source_row_lens,
+            cu_seqlens_k_out=metadata.sparse_cu_seqlens_k,
             dense_len=self.dense_len,
             sparse_topk=self.sparse_topk,
             block_size=self.block_size,
-            num_draft_tokens=num_draft_tokens,
-        )
-        row_lens[real_rows:] = 0
-        if metadata.verify_draft_tree_mask is not None:
-            offsets = torch.arange(
-                1, num_draft_tokens + 1, dtype=torch.int32, device=seq_lens.device
-            ).repeat(seq_lens.numel())
-            metadata.verify_prefix_lens.copy_(seq_lens)
-            metadata.verify_source_row_lens.copy_(row_lens)
-            # Padding rows' all-True squares popcount to the offsets, so they
-            # stay zero.
-            row_lens = row_lens - (
-                offsets - metadata.verify_num_visible
-            ).repeat_interleave(self.head_group_num)
-        metadata.token_pos_in_bs.copy_(token_pos)
-        metadata.sparse_cache_seqlens_int32.copy_(row_lens)
-        torch.cumsum(
-            row_lens, dim=0, dtype=torch.int32, out=metadata.sparse_cu_seqlens_k[1:]
-        )
-        # Per-row decode-form cache length for the block selection.
-        metadata.cache_seqlens_int32_stage1.copy_(token_pos - 1)
-        _build_dense_verify_overwrite(
-            token_pos,
-            metadata.token_to_bs,
-            metadata.base.page_table,
-            dense_len=self.dense_len,
+            real_rows=real_rows,
+            bs=seq_lens.numel(),
+            num_draft_tokens=self.speculative_num_draft_tokens,
             head_group_num=self.head_group_num,
-            out_rows=metadata.verify_dense_rows,
-            out_mask=metadata.verify_dense_mask,
         )
+        if self.speculative_eagle_topk == 1:
+            # Chain-only: tree rounds fill their dense rows via the compaction kernels
+            # (see fill_dense_page_table_rows).
+            _build_dense_verify_overwrite(
+                metadata.token_pos_in_bs,
+                metadata.token_to_bs,
+                metadata.base.page_table,
+                dense_len=self.dense_len,
+                head_group_num=self.head_group_num,
+                out_rows=metadata.verify_dense_rows,
+                out_mask=metadata.verify_dense_mask,
+            )
 
     def _replay_sparse_verify_graph_metadata(
         self,
@@ -1779,15 +1827,15 @@ class MiniCPMSparseBackend(AttentionBackend):
                 level.cu_new_token_nums.zero_()
             return
 
-        history_lens = None
         if self.speculative_eagle_topk > 1:
-            # FA's topk>1 replay refresh leaves the static base buffers in
-            # the two-phase tree layout (prefix-only lengths, prefix-only
-            # page-table rows); restore the uniform prefix + num_draft_tokens
-            # geometry the sparse verify rows consume, in place so the
-            # captured fill kernels keep reading the same buffers.
+            # FA's tree replay fill is bypassed above,
+            # so rebuild the base geometry in place from the live batch.
             base = metadata.base
-            base.cache_seqlens_int32.add_(num_draft_tokens)
+            torch.add(
+                forward_batch.seq_lens,
+                num_draft_tokens,
+                out=base.cache_seqlens_int32,
+            )
             torch.cumsum(
                 base.cache_seqlens_int32,
                 dim=0,
@@ -1802,7 +1850,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                 page_size=self.page_size,
             )
 
-            # Must precede the row refresh, which reads the staged square.
+            # Must precede the row refresh,
+            # which reads the staged visibility counts.
             copy_eagle_draft_tree_mask(
                 out=metadata.verify_draft_tree_mask,
                 num_visible_out=metadata.verify_num_visible,
@@ -1812,9 +1861,6 @@ class MiniCPMSparseBackend(AttentionBackend):
                 bs=real_bs,
                 padded_bs=bs,
             )
-            history_lens = (forward_batch.seq_lens[:real_bs] - num_draft_tokens).clamp(
-                min=0
-            )
 
         # Padding slots keep the runner's seq-len fill value,
         # so their token positions stay in range.
@@ -1823,39 +1869,8 @@ class MiniCPMSparseBackend(AttentionBackend):
             forward_batch.seq_lens,
             real_rows=real_bs * num_draft_tokens * self.head_group_num,
         )
-
-        # Slots this round's compression pass does not rewrite must read as
-        # unselectable: the captured gather reads a full segment_rows slab
-        # per request, past the chunk rows this round wrote for it.
-        for name, kernel_stride in (
-            ("k1", self.k1_kernel_stride),
-            ("k2", self.k2_kernel_stride),
-        ):
-            self.decode_cuda_graph_metadata[f"compress_{name}"][
-                : real_bs * self.max_context_len // kernel_stride
-            ].fill_(float("-inf"))
-
-        compression_metadata = _build_k1_k2_compression_metadata(
-            req_pool_indices=forward_batch.req_pool_indices[:real_bs],
-            base_metadata=metadata.base,
-            req_to_sparse_k1_token=self.req_to_sparse_k1_token,
-            req_to_sparse_k2_token=self.req_to_sparse_k2_token,
-            k1_kernel_size=self.k1_kernel_size,
-            k1_kernel_stride=self.k1_kernel_stride,
-            k2_kernel_size=self.k2_kernel_size,
-            k2_kernel_stride=self.k2_kernel_stride,
-            seq_lens_cpu=forward_batch.seq_lens_cpu[:real_bs] + num_draft_tokens,
-            history_lens=history_lens,
-        )
-        # cu_total_compress_token_nums keeps the uniform capture-time slab
-        # offsets (the static repeat depends on them), so only the packed
-        # per-request lengths are refreshed.
-        self._replay_compression_graph_metadata(
-            forward_batch=forward_batch,
-            metadata=metadata,
-            compression_metadata=compression_metadata,
-            real_bs=real_bs,
-            cu_fields=("cu_seqlens", "cu_new_token_nums"),
+        self._refresh_verify_compression_metadata(
+            forward_batch, metadata, real_bs=real_bs
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
