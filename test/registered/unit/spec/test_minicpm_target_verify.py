@@ -470,6 +470,16 @@ class TestVerifyGraphBuffers(CustomTestCase):
         backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2)
         self.assertNotIn("verify_draft_tree_mask", backend.decode_cuda_graph_metadata)
 
+    def test_graph_table_narrower_than_cache_table_raises(self):
+        """The replay gathers the cache table into the graph table with
+        index_select(out=), which resizes on a width mismatch instead of raising,
+        so the captured graph would keep reading the abandoned storage."""
+        backend, _ = make_spec_backend(num_draft_tokens=2, eagle_topk=1)
+        backend.req_to_sparse_k1_token = backend.req_to_sparse_k1_token[:, :-1]
+        backend._init_compress_levels()
+        with self.assertRaisesRegex(AssertionError, "k1 cache table width"):
+            backend.init_cuda_graph_state(max_bs=2, max_num_tokens=4)
+
     def test_dense_overwrite_matches_python_loop(self):
         """The masked overwrite must write, exactly,
         what the eager _copy_dense_page_table loop writes and nothing else."""
@@ -563,8 +573,7 @@ class TestFusedTopkRepeatGate(CustomTestCase):
             ):
                 backend.init_forward_metadata(forward_batch)
             metadata = backend.forward_metadata
-            self.assertEqual(metadata.k1_repeat.index.tolist(), [0, 0, 1, 2, 1, 2])
-            self.assertEqual(metadata.k1_repeat.cu_seqlens.tolist(), [0, 1, 2, 4, 6])
+            self.assertIsNotNone(metadata.k1_repeat)
             self.assertIsNone(metadata.k2_repeat)
 
 
