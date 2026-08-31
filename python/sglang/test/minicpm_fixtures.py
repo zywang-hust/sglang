@@ -32,6 +32,7 @@ def make_runner_scaffold(
     *,
     max_context_len=1024,
     max_running_requests=1,
+    num_kv_heads=1,
 ):
     """Build the (model_runner, flash_attn_backend) SimpleNamespace pair
     that MiniCPMSparseBackend construction reads;
@@ -76,9 +77,9 @@ def make_runner_scaffold(
                     "topk": 1,
                 },
             ),
-            num_attention_heads=16,
+            num_attention_heads=16 * num_kv_heads,
             head_dim=128,
-            get_num_kv_heads=lambda _tp: 1,
+            get_num_kv_heads=lambda _tp: num_kv_heads,
         ),
     )
     return model_runner, flash_attn_backend
@@ -98,15 +99,18 @@ def make_sparse_backend(
     blackwell=False,
     kv_cache_dtype_str="bfloat16",
     server_args_overrides=None,
+    num_kv_heads=1,
 ):
     """A CPU MiniCPMSparseBackend over the mocked runner scaffold; returns
     (backend, model_runner, flash_attn_backend, flash_attention_ctor)."""
     model_runner, flash_attn_backend = make_runner_scaffold(
         max_context_len=max_context_len,
         max_running_requests=max_running_requests,
+        num_kv_heads=num_kv_heads,
     )
     flash_attn_backend.kv_cache_dtype_str = kv_cache_dtype_str
     flash_attn_backend.init_forward_metadata = Mock()
+    flash_attn_backend.init_cuda_graph_state = Mock()
     flash_attn_backend.forward_metadata = None
     # The constructor reads chunked_prefill_size and the draft shape off the
     # published context; publish them for the build.
@@ -137,14 +141,15 @@ def make_sparse_backend(
     return backend, model_runner, flash_attn_backend, flash_attention
 
 
-def make_spec_backend(*, num_draft_tokens, eagle_topk):
+def make_spec_backend(*, num_draft_tokens, eagle_topk, num_kv_heads=1):
     """Build a MiniCPMSparseBackend configured for one draft shape,
     with a mocked adapter. Returns (backend, flash_attn_backend)."""
     backend, _, flash_attn_backend, _ = make_sparse_backend(
         server_args_overrides={
             "speculative_num_draft_tokens": num_draft_tokens,
             "speculative_eagle_topk": eagle_topk,
-        }
+        },
+        num_kv_heads=num_kv_heads,
     )
     backend.attention_adapter = Mock()
     return backend, flash_attn_backend
@@ -159,13 +164,14 @@ def _verify_round_layout(*, seq_lens, num_draft_tokens):
         0, bs * num_draft_tokens + 1, num_draft_tokens, dtype=torch.int32
     )
     cu_seqlens_k = F.pad(torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0))
-    return seq_lens_cpu, cache_seqlens, cu_seqlens_q, cu_seqlens_k
+    return cache_seqlens, cu_seqlens_q, cu_seqlens_k
 
 
 def make_verify_batch(seq_lens, num_draft_tokens):
     """Build one verify round's eager inputs: (forward_batch, base)."""
     bs = len(seq_lens)
-    seq_lens_cpu, cache_seqlens, cu_seqlens_q, cu_seqlens_k = _verify_round_layout(
+    seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
+    cache_seqlens, cu_seqlens_q, cu_seqlens_k = _verify_round_layout(
         seq_lens=seq_lens, num_draft_tokens=num_draft_tokens
     )
     forward_batch = SimpleNamespace(
@@ -208,3 +214,35 @@ def plan_verify(
         num_draft_tokens=num_draft_tokens,
     )
     return forward_batch, base, metadata
+
+
+def make_replay_backend(
+    seq_lens,
+    num_draft_tokens,
+    *,
+    eagle_topk=1,
+    num_kv_heads=1,
+    max_bs,
+):
+    """Size a backend's CUDA-graph buffers for max_bs verify requests;
+    return (backend, base) with the static base buffers the replay leaves."""
+    bs = len(seq_lens)
+    cache_seqlens, cu_seqlens_q, cu_seqlens_k = _verify_round_layout(
+        seq_lens=seq_lens, num_draft_tokens=num_draft_tokens
+    )
+    backend, _ = make_spec_backend(
+        num_draft_tokens=num_draft_tokens,
+        eagle_topk=eagle_topk,
+        num_kv_heads=num_kv_heads,
+    )
+    backend.init_cuda_graph_state(max_bs, max_bs * num_draft_tokens)
+    base = SimpleNamespace(
+        cache_seqlens_int32=cache_seqlens,
+        max_seq_len_q=num_draft_tokens,
+        max_seq_len_k=int(cache_seqlens.max()),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        # The graph page table spans the context; page_size is 1 in the scaffold.
+        page_table=torch.zeros((bs, backend.max_context_len), dtype=torch.int32),
+    )
+    return backend, base

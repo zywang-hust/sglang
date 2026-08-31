@@ -462,7 +462,7 @@ class MiniCPMSparseMetadata(msgspec.Struct):
     sparse_cu_seqlens_q: Optional[torch.Tensor] = None
     sparse_cu_seqlens_k: Optional[torch.Tensor] = None
     sparse_max_seq_len_q: int = 1
-    # Stage-1 cache lengths excluding the current token (decode topk gate).
+    # Stage-1 cache lengths excluding the current token (decode/verify topk gate).
     cache_seqlens_int32_stage1: Optional[torch.Tensor] = None
     # Stage-1 query geometry expanded to one row per (token, head group).
     cu_seqlens_q_adjusted: Optional[torch.Tensor] = None
@@ -657,6 +657,8 @@ def _build_dense_verify_overwrite(
     *,
     dense_len: int,
     head_group_num: int,
+    out_rows: Optional[torch.Tensor] = None,
+    out_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Eager base.page_table can be narrower than dense_len; graph tables are
     # max_context_len wide, so the clamp is an identity there.
@@ -671,8 +673,13 @@ def _build_dense_verify_overwrite(
     col_limits = torch.where(token_pos < dense_len, token_pos, 0)
     # Group-interleaved prefix pages plus the mask of entries they replace,
     # in the layout _copy_dense_page_table writes.
-    rows = group_offsets[None, :, None] + dense_src[:, None, :] * head_group_num
-    mask = cols[None, None, :] < col_limits[:, None, None]
+    rows = torch.add(
+        group_offsets[None, :, None],
+        dense_src[:, None, :],
+        alpha=head_group_num,
+        out=out_rows,
+    )
+    mask = torch.lt(cols[None, None, :], col_limits[:, None, None], out=out_mask)
     return rows, mask
 
 
@@ -796,12 +803,17 @@ def _plan_repeated_segments(
     *,
     total_tokens: int,
     repeats: int,
+    segment_starts: Optional[torch.Tensor] = None,
 ) -> RepeatedSegmentLayout:
     lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).repeat_interleave(repeats)
     out_cu_seqlens = F.pad(torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0))
+    # segment_starts locates each request's chunks in the source buffer
+    # when it is not packed (the CUDA graph slab); the output stays packed.
+    if segment_starts is None:
+        segment_starts = cu_seqlens[:-1]
     # index[i] = segment_start + (i - output_row_start),
     # so each output row adds (segment_start - output_row_start) to a flat arange.
-    row_delta = (cu_seqlens[:-1].repeat_interleave(repeats) - out_cu_seqlens[:-1]).to(
+    row_delta = (segment_starts.repeat_interleave(repeats) - out_cu_seqlens[:-1]).to(
         torch.int64
     )
     # total_tokens as output_size keeps repeat_interleave sync-free.
