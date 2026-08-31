@@ -27,6 +27,7 @@ def make_runner_scaffold(
     req_pool = SimpleNamespace(
         req_to_sparse_k1_token=torch.empty(0),
         req_to_sparse_k2_token=torch.empty(0),
+        req_to_token=torch.arange(8 * 1024, dtype=torch.int32).view(8, 1024),
     )
     flash_attn_backend = SimpleNamespace(
         max_context_len=max_context_len,
