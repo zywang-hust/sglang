@@ -38,6 +38,8 @@ def make_runner_scaffold(
     server_args_fields = {
         "enable_memory_saver": False,
         "chunked_prefill_size": 64,
+        "speculative_num_draft_tokens": None,
+        "speculative_eagle_topk": None,
     }
     server_args_fields.update(server_args_overrides or {})
     server_args = SimpleNamespace(**server_args_fields)

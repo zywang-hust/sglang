@@ -478,6 +478,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             extend_seq_lens_cpu=[1],
             extend_prefix_lens_cpu=[0],
             forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
                 is_extend_or_draft_extend_or_mixed=lambda: True,
             ),
         )
@@ -629,6 +630,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             extend_prefix_lens_cpu=[49, 199],
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
                 is_extend_or_draft_extend_or_mixed=lambda: True,
             ),
         )
@@ -720,6 +722,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             out_cache_loc=torch.tensor([0, 1], dtype=torch.int64),
             forward_mode=SimpleNamespace(
                 is_draft_extend_v2=lambda: False,
+                is_target_verify=lambda: False,
             ),
         )
 
@@ -804,79 +807,29 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             expected_table=[[21]],
         )
 
-    def test_dense_decode_copies_full_page_table(self):
-        backend = MiniCPMSparseBackend.__new__(MiniCPMSparseBackend)
-        q = torch.ones(1, 1)
-        k = torch.ones(1, 1, 1)
-        v = torch.ones(1, 1, 1)
-        key_cache = torch.ones(4, 1, 1, 1)
-        value_cache = torch.ones(4, 1, 1, 1)
-        backend.flash_attn_backend = SimpleNamespace(
-            prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
-            get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
-            forward_decode=Mock(),
-        )
-        backend.token_to_kv_pool = SimpleNamespace(set_kv_buffer=Mock())
-        backend.attention_adapter = SimpleNamespace(
-            forward=Mock(return_value=torch.ones(1, 1, 1))
-        )
-        backend.forward_metadata = sparse_utils.MiniCPMSparseMetadata(
-            base=SimpleNamespace(
-                page_table=torch.tensor([[5, 6, 7, 0]], dtype=torch.int32),
-                cache_seqlens_int32=torch.tensor([3], dtype=torch.int32),
-                max_seq_len_q=1,
-            ),
-            sparse_page_table=torch.zeros((1, 4), dtype=torch.int32),
-            sparse_cache_seqlens_int32=torch.tensor([3], dtype=torch.int32),
-            sparse_cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
-            sparse_cu_seqlens_k=torch.tensor([0, 3], dtype=torch.int32),
-            token_to_bs=torch.tensor([0], dtype=torch.int32),
-            token_pos_in_bs=torch.tensor([3], dtype=torch.int32),
-            seqlen_k_sparse_bs_tensor=torch.tensor([3], dtype=torch.int32),
-            dense_rows=[(0, 0, 3)],
-            sparse_row_mask=torch.tensor([[False]]),
-        )
-        backend.head_group_num = 1
-        backend.heads_per_group = 1
-        backend.block_size = 1
-        backend.num_sparse_topk_tokens = 2
-        backend.dense_len = 4
-        backend._use_cuda_graph_buffers = False
-        backend._compress_decode_keys = Mock()
-        topk_idx = torch.tensor([[[0, 1]]], dtype=torch.int32)
-        backend.get_topk_for_sparse = Mock(return_value=topk_idx)
-        layer = SimpleNamespace(
-            is_cross_attention=False,
-            sliding_window_size=-1,
-            tp_q_head_num=1,
-            tp_k_head_num=1,
-            tp_v_head_num=1,
-            head_dim=1,
-            v_head_dim=1,
-            k_scale=None,
-            v_scale=None,
-        )
-        forward_batch = SimpleNamespace(
-            batch_size=1,
-            out_cache_loc=torch.tensor([1], dtype=torch.int64),
-        )
+    def test_dense_decode_plans_full_page_table_rows(self):
+        """Eager decode planning must write a dense request's prefix pages
+        (group-interleaved) into its sparse_page_table rows and mask those rows
+        out of the per-layer sparse gather; a sparse request gets the inverse."""
+        backend, forward_batch, metadata = _dense_decode_scaffold(8192, 7000)
+        pages = torch.arange(7000, dtype=torch.int32)
+        metadata.base.page_table.copy_(pages[None, :])
+        backend.update_batch_for_sparse(forward_batch, metadata)
 
-        with patch.object(
-            backend_module,
-            "get_block_table",
-            return_value=torch.tensor([[9, 9]], dtype=torch.int32),
-        ):
-            backend.forward_decode(q, k, v, layer, forward_batch)
+        self.assertEqual(metadata.dense_rows, [(0, 0, 7000)])
+        self.assertEqual(metadata.sparse_row_mask.tolist(), [[False], [False]])
+        for group in range(2):
+            self.assertTrue(
+                torch.equal(metadata.sparse_page_table[group, :7000], pages * 2 + group)
+            )
+        self.assertEqual(int(metadata.sparse_page_table[:, 7000:].abs().sum()), 0)
 
-        backend.get_topk_for_sparse.assert_called_once()
-        backend._compress_decode_keys.assert_not_called()
-        backend.attention_adapter.forward.assert_called_once()
-        backend.flash_attn_backend.forward_decode.assert_not_called()
-        # The masked gather leaves the dense row to the dense_rows copy,
-        # which writes the live prefix pages and leaves the tail untouched.
-        self.assertEqual(
-            backend.forward_metadata.sparse_page_table.tolist(), [[5, 6, 7, 0]]
-        )
+        backend, forward_batch, metadata = _dense_decode_scaffold(2048, 3000)
+        backend.update_batch_for_sparse(forward_batch, metadata)
+
+        self.assertEqual(metadata.dense_rows, [])
+        self.assertEqual(metadata.sparse_row_mask.tolist(), [[True], [True]])
+        self.assertEqual(int(metadata.sparse_page_table.abs().sum()), 0)
 
     def test_decode_sparse_gather_preserves_dense_rows(self):
         """The decode sparse gather must not touch rows sparse_row_mask clears;
@@ -937,6 +890,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         forward_batch = SimpleNamespace(
             batch_size=2,
             out_cache_loc=torch.tensor([1, 2], dtype=torch.int64),
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
         )
 
         with patch.object(

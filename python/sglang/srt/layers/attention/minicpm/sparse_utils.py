@@ -268,7 +268,7 @@ def compressed_attention(
                 cache_lens = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
 
         # With >= topk live blocks no padded tail can be selected;
-        # decode keeps static shapes for CUDA graphs.
+        # decode/verify keep static shapes for CUDA graphs.
         selection_context_len = (
             max(max_seqlen_k, topk * block_size) if is_prefilling else max_context_len
         )
@@ -410,6 +410,15 @@ class CompressionLevelMetadata(msgspec.Struct):
     cu_total_compress_token_nums: Optional[torch.Tensor] = None
 
 
+class RepeatedSegmentLayout(msgspec.Struct):
+    """Per-row gather of each request's compressed segment:
+    ``index`` gathers the repeated segments from a flat compressed cache;
+    ``cu_seqlens`` bounds them per row."""
+
+    index: torch.Tensor
+    cu_seqlens: torch.Tensor
+
+
 class MiniCPMSparseMetadata(msgspec.Struct):
     """Per-forward sparse-attention metadata: the FlashAttention base geometry
     plus the row, selection and compression fields the MiniCPM backend plans around it.
@@ -421,6 +430,9 @@ class MiniCPMSparseMetadata(msgspec.Struct):
     # Per-request compressed-level metadata (cu_seqlens, token tables).
     k1: Optional[CompressionLevelMetadata] = None
     k2: Optional[CompressionLevelMetadata] = None
+    # Verify-round expansion of the levels: one segment copy per draft token.
+    k1_repeat: Optional[RepeatedSegmentLayout] = None
+    k2_repeat: Optional[RepeatedSegmentLayout] = None
     # Requests taking the sparse path this prefill,
     # and the sparse_page_table rows they occupy.
     sparse_bs_list: Optional[list[int]] = None
@@ -434,8 +446,8 @@ class MiniCPMSparseMetadata(msgspec.Struct):
     # [rows, 1] bool, True on the decode rows the per-layer sparse gather
     # may overwrite (kv >= dense_len); dense rows keep their planned pages.
     sparse_row_mask: Optional[torch.Tensor] = None
-    # Per-sparse-request kv lengths: the base cache lengths for
-    # decode, the sparse sub-batch lengths for prefill.
+    # Per-sparse-request kv lengths: the base cache lengths for decode/verify,
+    # the sparse sub-batch lengths for prefill.
     seqlen_k_sparse_bs_tensor: Optional[torch.Tensor] = None
     # Token row -> request index, and the row's 1-based causal position
     # (the attention gate is key_pos < token_pos_in_bs).
@@ -443,7 +455,7 @@ class MiniCPMSparseMetadata(msgspec.Struct):
     token_pos_in_bs: Optional[torch.Tensor] = None
     # Head-group-interleaved block table for the sparse rows.
     sparse_page_table: Optional[torch.Tensor] = None
-    # Varlen geometry of the sparse row attention (decode rows).
+    # Varlen geometry of the sparse row attention (decode or verify rows).
     sparse_cache_seqlens_int32: Optional[torch.Tensor] = None
     sparse_cu_seqlens_q: Optional[torch.Tensor] = None
     sparse_cu_seqlens_k: Optional[torch.Tensor] = None
@@ -476,10 +488,6 @@ def _assign_row_metadata(
     topk_max_seqlen_q: int,
     topk_max_seqlen_k: int,
 ) -> None:
-    """Assign the row-shaped selection metadata for eager decode rows. No
-    field has a default, so the call site must pass the complete set.
-    ``seqlen_k_sparse_bs_tensor`` is always the base cache lengths and is
-    read off ``metadata.base`` here."""
     metadata.sparse_cache_seqlens_int32 = sparse_cache_seqlens_int32
     metadata.sparse_cu_seqlens_q = sparse_cu_seqlens_q
     metadata.sparse_cu_seqlens_k = sparse_cu_seqlens_k
@@ -598,6 +606,20 @@ def _get_sparse_cache_lens(
         sparse_capacity - block_size + remainder,
     )
     return torch.where(seq_lens <= sparse_capacity, seq_lens, sparse_lens)
+
+
+def _get_sparse_cache_len(
+    seq_len: int,
+    sparse_capacity: int,
+    block_size: int,
+) -> int:
+    """Host-side scalar twin of ``_get_sparse_cache_lens`` above."""
+    if seq_len <= sparse_capacity:
+        return seq_len
+    remainder = seq_len % block_size
+    return (
+        sparse_capacity if remainder == 0 else sparse_capacity - block_size + remainder
+    )
 
 
 def _plan_dense_rows(
@@ -723,6 +745,115 @@ def _plan_sparse_prefill(
     else:
         metadata.cu_seqlens_q_adjusted = metadata.base.cu_seqlens_q * heads_per_group
         metadata.max_seqlen_q_adjusted = metadata.base.max_seq_len_q * heads_per_group
+
+
+def _plan_repeated_segments(
+    cu_seqlens: torch.Tensor,
+    *,
+    total_tokens: int,
+    repeats: int,
+) -> RepeatedSegmentLayout:
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).repeat_interleave(repeats)
+    out_cu_seqlens = F.pad(torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0))
+    # index[i] = segment_start + (i - output_row_start),
+    # so each output row adds (segment_start - output_row_start) to a flat arange.
+    row_delta = (cu_seqlens[:-1].repeat_interleave(repeats) - out_cu_seqlens[:-1]).to(
+        torch.int64
+    )
+    # total_tokens as output_size keeps repeat_interleave sync-free.
+    index = row_delta.repeat_interleave(
+        lengths.to(torch.int64), output_size=repeats * total_tokens
+    ) + torch.arange(
+        repeats * total_tokens, dtype=torch.int64, device=cu_seqlens.device
+    )
+    return RepeatedSegmentLayout(index=index, cu_seqlens=out_cu_seqlens)
+
+
+def _plan_sparse_verify(
+    forward_batch: ForwardBatch,
+    metadata: MiniCPMSparseMetadata,
+    *,
+    head_group_num: int,
+    heads_per_group: int,
+    dense_len: int,
+    sparse_topk: int,
+    block_size: int,
+    num_draft_tokens: int,
+) -> None:
+    """Plan sparse metadata for target verify with a chain draft layout.
+
+    Verify is a uniform extend of ``num_draft_tokens`` tokens per request on a
+    committed prefix, and every (draft token, head group) pair runs as one
+    single-query row of the paged decode kernel. All fields are therefore
+    built in closed form. A draft token at causal position ``p`` attends the
+    same key set as a decode step at sequence length ``p``: its row length is
+    ``_get_sparse_cache_len(p)`` for sparse rows and ``p`` for dense rows
+    (``p < dense_len``). These row lengths are what the FlashInfer plan
+    consumes, and the selection kernel writes exactly that many page-table
+    entries per row -- the plan and the filled rows must match row for row.
+
+    Block selection likewise runs the decode form: one single-query row per
+    draft token with per-row cache length ``p - 1``.
+    """
+    base_metadata = metadata.base
+    bs = forward_batch.batch_size
+    device = base_metadata.cu_seqlens_q.device
+    sparse_capacity = sparse_topk * block_size
+
+    token_to_bs = torch.repeat_interleave(
+        torch.arange(bs, dtype=torch.int32, device=device), num_draft_tokens
+    )
+    token_offsets = torch.arange(
+        1, num_draft_tokens + 1, dtype=torch.int32, device=device
+    ).repeat(bs)
+    prefix_lens = forward_batch.seq_lens.to(torch.int32)
+    token_pos_in_bs = prefix_lens.repeat_interleave(num_draft_tokens) + token_offsets
+
+    rows = bs * num_draft_tokens * head_group_num
+    sparse_cu_seqlens_q = torch.arange(rows + 1, dtype=torch.int32, device=device)
+    verify_cu_seqlens_q = torch.arange(
+        bs * num_draft_tokens + 1, dtype=torch.int32, device=device
+    )
+
+    row_lens_cpu = torch.empty((rows,), dtype=torch.int32, device="cpu")
+    dense_rows = []
+    for batch_idx in range(bs):
+        prefix_len = int(forward_batch.seq_lens_cpu[batch_idx])
+        for draft_idx in range(num_draft_tokens):
+            token_pos = prefix_len + draft_idx + 1
+            row_start = (batch_idx * num_draft_tokens + draft_idx) * head_group_num
+            if token_pos < dense_len:
+                row_len = token_pos
+                dense_rows.append((row_start, batch_idx, token_pos))
+            else:
+                row_len = _get_sparse_cache_len(token_pos, sparse_capacity, block_size)
+            row_lens_cpu[row_start : row_start + head_group_num] = row_len
+
+    sparse_cache_seqlens_int32 = row_lens_cpu.to(device=device)
+    metadata.dense_rows = dense_rows
+    _assign_row_metadata(
+        metadata,
+        sparse_cache_seqlens_int32=sparse_cache_seqlens_int32,
+        sparse_cu_seqlens_q=sparse_cu_seqlens_q,
+        sparse_cu_seqlens_k=F.pad(
+            torch.cumsum(sparse_cache_seqlens_int32, dim=0, dtype=torch.int32),
+            (1, 0),
+        ),
+        sparse_page_table=torch.zeros(
+            (rows, max(dense_len, sparse_capacity)),
+            dtype=base_metadata.page_table.dtype,
+            device=base_metadata.page_table.device,
+        ),
+        token_to_bs=token_to_bs,
+        token_pos_in_bs=token_pos_in_bs,
+        cache_seqlens_int32_stage1=token_pos_in_bs - 1,
+        cu_seqlens_q_adjusted=verify_cu_seqlens_q * heads_per_group,
+        max_seqlen_q_adjusted=heads_per_group,
+        topk_cu_seqlens_q=verify_cu_seqlens_q,
+        topk_cu_seqlens_k=base_metadata.cu_seqlens_k,
+        topk_max_seqlen_q=1,
+        topk_max_seqlen_k=base_metadata.max_seq_len_k,
+    )
 
 
 class SparseDecodeMetadata(msgspec.Struct):
