@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.minicpm_fixtures import (
+    pack_custom_mask,
+    tree_mask_from_parents,
+    visible_counts,
+)
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -32,47 +37,7 @@ HEAD_GROUP = 2
 NUM_DRAFT_TOKENS = 3
 
 
-def _visible_counts(mask, bs, num_draft_tokens):
-    """Causal-prefix popcount oracle of a staged visibility square."""
-    causal = torch.tril(
-        torch.ones(
-            (num_draft_tokens, num_draft_tokens), dtype=torch.bool, device=mask.device
-        )
-    )
-    return (
-        (mask.view(bs, num_draft_tokens, num_draft_tokens) & causal)
-        .sum(dim=-1, dtype=torch.int32)
-        .view(-1)
-    )
-
-
-def _tree_mask_from_parents(parents):
-    """Ancestor-closure visibility square of one request's draft tree."""
-    num_draft_tokens = len(parents)
-    mask = torch.zeros((num_draft_tokens, num_draft_tokens), dtype=torch.bool)
-    for token in range(num_draft_tokens):
-        node = token
-        while node != -1:
-            mask[token, node] = True
-            node = parents[node]
-    return mask
-
-
-def _pack_custom_mask(seq_lens, squares):
-    """Pack per-request squares in EAGLE's custom_mask layout (prefix columns
-    all-visible)."""
-    rows = []
-    for seq_len, square in zip(seq_lens, squares):
-        num_draft_tokens = square.shape[0]
-        request = torch.ones(
-            (num_draft_tokens, seq_len + num_draft_tokens), dtype=torch.bool
-        )
-        request[:, seq_len:] = square
-        rows.append(request.view(-1))
-    return torch.cat(rows).to(DEVICE)
-
-
-def _verify_metadata(seq_lens, visible_counts, dense_len):
+def _verify_metadata(seq_lens, draft_visible, dense_len):
     bs = len(seq_lens)
     seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
     cache_seqlens = (seq_lens_cpu + NUM_DRAFT_TOKENS).to(DEVICE)
@@ -104,9 +69,22 @@ def _verify_metadata(seq_lens, visible_counts, dense_len):
         sparse_topk=SPARSE_TOPK,
         block_size=BLOCK_SIZE,
         num_draft_tokens=NUM_DRAFT_TOKENS,
-        num_draft_visible=visible_counts,
+        num_draft_visible=draft_visible,
     )
     return metadata
+
+
+def _copy_tree_mask(out, num_visible_out, custom_mask, seq_lens, bs, padded_bs):
+    """The tree-mask copy call shared by the extraction and padding tests."""
+    copy_eagle_draft_tree_mask(
+        out=out,
+        num_visible_out=num_visible_out,
+        custom_mask=custom_mask,
+        seq_lens=seq_lens,
+        num_draft_tokens=NUM_DRAFT_TOKENS,
+        bs=bs,
+        padded_bs=padded_bs,
+    )
 
 
 class TestCopyEagleDraftTreeMask(CustomTestCase):
@@ -114,11 +92,11 @@ class TestCopyEagleDraftTreeMask(CustomTestCase):
         """A base or stride slip would read a neighbouring request's visibility bits."""
         seq_lens = [7, 3, 12]
         squares = [
-            _tree_mask_from_parents([-1, 0, 0]),
-            _tree_mask_from_parents([-1, 0, 1]),
-            _tree_mask_from_parents([-1, -1, 1]),
+            tree_mask_from_parents([-1, 0, 0]),
+            tree_mask_from_parents([-1, 0, 1]),
+            tree_mask_from_parents([-1, -1, 1]),
         ]
-        custom_mask = _pack_custom_mask(seq_lens, squares)
+        custom_mask = pack_custom_mask(seq_lens, squares, device=DEVICE)
         seq_lens_gpu = torch.tensor(seq_lens, dtype=torch.int64, device=DEVICE)
         bs = len(seq_lens)
         out = torch.zeros(
@@ -127,25 +105,27 @@ class TestCopyEagleDraftTreeMask(CustomTestCase):
         counts = torch.full(
             (bs * NUM_DRAFT_TOKENS,), -1, dtype=torch.int32, device=DEVICE
         )
-        copy_eagle_draft_tree_mask(
+        _copy_tree_mask(
             out=out,
             num_visible_out=counts,
             custom_mask=custom_mask,
             seq_lens=seq_lens_gpu,
-            num_draft_tokens=NUM_DRAFT_TOKENS,
             bs=bs,
             padded_bs=bs,
         )
         want = torch.stack(squares).view(-1).to(DEVICE)
         self.assertTrue(torch.equal(out, want))
         self.assertTrue(
-            torch.equal(counts, _visible_counts(want, bs, NUM_DRAFT_TOKENS))
+            torch.equal(
+                counts,
+                visible_counts(mask=want, bs=bs, num_draft_tokens=NUM_DRAFT_TOKENS),
+            )
         )
 
     def test_padding_rows_are_all_true(self):
         seq_lens = [5]
-        squares = [_tree_mask_from_parents([-1, 0, 1])]
-        custom_mask = _pack_custom_mask(seq_lens, squares)
+        squares = [tree_mask_from_parents([-1, 0, 1])]
+        custom_mask = pack_custom_mask(seq_lens, squares, device=DEVICE)
         seq_lens_gpu = torch.tensor(seq_lens, dtype=torch.int64, device=DEVICE)
         padded_bs = 3
         out = torch.zeros(
@@ -156,12 +136,11 @@ class TestCopyEagleDraftTreeMask(CustomTestCase):
         counts = torch.full(
             (padded_bs * NUM_DRAFT_TOKENS,), -1, dtype=torch.int32, device=DEVICE
         )
-        copy_eagle_draft_tree_mask(
+        _copy_tree_mask(
             out=out,
             num_visible_out=counts,
             custom_mask=custom_mask,
             seq_lens=seq_lens_gpu,
-            num_draft_tokens=NUM_DRAFT_TOKENS,
             bs=1,
             padded_bs=padded_bs,
         )
@@ -204,22 +183,32 @@ def _fill_source_rows(page_table_cpu, topk_idx_cpu, token_to_bs, token_pos):
     return rows
 
 
+def _tree_case(seq_lens):
+    """The draft-tree case shared by the compaction and dense fill tests."""
+    bs = len(seq_lens)
+    parents = [-1, 0, -1]
+    squares = [tree_mask_from_parents(parents)] * bs
+    draft_tree_mask = torch.stack(squares).view(-1).to(DEVICE)
+    draft_visible = visible_counts(
+        mask=draft_tree_mask, bs=bs, num_draft_tokens=NUM_DRAFT_TOKENS
+    )
+
+    token_to_bs = [b for b in range(bs) for _ in range(NUM_DRAFT_TOKENS)]
+    token_pos = [
+        seq_lens[b] + i + 1 for b in range(bs) for i in range(NUM_DRAFT_TOKENS)
+    ]
+    tokens = bs * NUM_DRAFT_TOKENS
+    return bs, squares, draft_tree_mask, draft_visible, token_to_bs, token_pos, tokens
+
+
 class TestCompactSparseTreePageTable(CustomTestCase):
     def test_compaction_matches_visibility_oracle_and_plan(self):
         """Kept count per row must equal the planned popcount row length,
         or attention reads planned slots the fill never wrote (loc 0)."""
         seq_lens = [5, 17]
-        bs = len(seq_lens)
-        parents = [-1, 0, -1]
-        squares = [_tree_mask_from_parents(parents)] * bs
-        draft_tree_mask = torch.stack(squares).view(-1).to(DEVICE)
-        visible_counts = _visible_counts(draft_tree_mask, bs, NUM_DRAFT_TOKENS)
-
-        token_to_bs = [b for b in range(bs) for _ in range(NUM_DRAFT_TOKENS)]
-        token_pos = [
-            seq_lens[b] + i + 1 for b in range(bs) for i in range(NUM_DRAFT_TOKENS)
-        ]
-        tokens = bs * NUM_DRAFT_TOKENS
+        bs, squares, draft_tree_mask, draft_visible, token_to_bs, token_pos, tokens = (
+            _tree_case(seq_lens)
+        )
 
         generator = torch.Generator().manual_seed(7)
         page_table_cpu = torch.randint(
@@ -244,7 +233,7 @@ class TestCompactSparseTreePageTable(CustomTestCase):
         source_rows_cpu = _fill_source_rows(
             page_table_cpu, topk_idx_cpu, token_to_bs, token_pos
         )
-        metadata = _verify_metadata(seq_lens, visible_counts, dense_len=0)
+        metadata = _verify_metadata(seq_lens, draft_visible, dense_len=0)
         source_lens = metadata.verify_source_row_lens
         row_lens = metadata.sparse_cache_seqlens_int32
 
@@ -296,17 +285,9 @@ class TestFillDensePageTableRows(CustomTestCase):
     def test_dense_rows_place_visible_drafts_after_prefix(self):
         dense_len = 32
         seq_lens = [5, 40]
-        bs = len(seq_lens)
-        parents = [-1, 0, -1]
-        squares = [_tree_mask_from_parents(parents)] * bs
-        draft_tree_mask = torch.stack(squares).view(-1).to(DEVICE)
-        visible_counts = _visible_counts(draft_tree_mask, bs, NUM_DRAFT_TOKENS)
-
-        token_to_bs = [b for b in range(bs) for _ in range(NUM_DRAFT_TOKENS)]
-        token_pos = [
-            seq_lens[b] + i + 1 for b in range(bs) for i in range(NUM_DRAFT_TOKENS)
-        ]
-        tokens = bs * NUM_DRAFT_TOKENS
+        bs, squares, draft_tree_mask, draft_visible, token_to_bs, token_pos, tokens = (
+            _tree_case(seq_lens)
+        )
         width = max(dense_len, CAPACITY)
 
         generator = torch.Generator().manual_seed(3)
@@ -330,7 +311,7 @@ class TestFillDensePageTableRows(CustomTestCase):
             head_group_num=HEAD_GROUP,
         )
 
-        metadata = _verify_metadata(seq_lens, visible_counts, dense_len=dense_len)
+        metadata = _verify_metadata(seq_lens, draft_visible, dense_len=dense_len)
         row_lens = metadata.sparse_cache_seqlens_int32
         for token in range(tokens):
             batch = token_to_bs[token]

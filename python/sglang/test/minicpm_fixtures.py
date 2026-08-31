@@ -8,6 +8,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.attention.minicpm import backend as backend_module
 from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
@@ -97,3 +98,127 @@ def make_sparse_backend(*, server_args_overrides=None, num_kv_heads=1):
     ):
         backend = MiniCPMSparseBackend(model_runner, use_flashinfer=False)
     return backend, flash_attn_backend
+
+
+def make_spec_backend(num_draft_tokens, eagle_topk, *, num_kv_heads=1):
+    """Build a MiniCPMSparseBackend configured for one draft shape,
+    with a mocked adapter. Returns (backend, flash_attn_backend)."""
+    backend, flash_attn_backend = make_sparse_backend(
+        server_args_overrides={
+            "speculative_num_draft_tokens": num_draft_tokens,
+            "speculative_eagle_topk": eagle_topk,
+        },
+        num_kv_heads=num_kv_heads,
+    )
+    backend.attention_adapter = Mock()
+    return backend, flash_attn_backend
+
+
+def _verify_round_layout(seq_lens, num_draft_tokens):
+    """The seq/cu_seqlens layout shared by the eager and replay builders."""
+    bs = len(seq_lens)
+    seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
+    cache_seqlens = seq_lens_cpu + num_draft_tokens
+    cu_seqlens_q = torch.arange(
+        0, bs * num_draft_tokens + 1, num_draft_tokens, dtype=torch.int32
+    )
+    cu_seqlens_k = F.pad(torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0))
+    return seq_lens_cpu, cache_seqlens, cu_seqlens_q, cu_seqlens_k
+
+
+def make_verify_batch(seq_lens, num_draft_tokens):
+    """Build one verify round's eager inputs: (forward_batch, base)."""
+    bs = len(seq_lens)
+    seq_lens_cpu, cache_seqlens, cu_seqlens_q, cu_seqlens_k = _verify_round_layout(
+        seq_lens, num_draft_tokens
+    )
+    forward_batch = SimpleNamespace(
+        batch_size=bs,
+        seq_lens=seq_lens_cpu.clone(),
+        seq_lens_cpu=seq_lens_cpu,
+        req_pool_indices=torch.arange(bs, dtype=torch.int64),
+    )
+    base = SimpleNamespace(
+        cache_seqlens_int32=cache_seqlens,
+        max_seq_len_k=int(cache_seqlens.max()),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=torch.zeros((bs, int(cache_seqlens.max())), dtype=torch.int32),
+    )
+    return forward_batch, base
+
+
+def make_replay_backend(
+    seq_lens,
+    num_draft_tokens,
+    *,
+    eagle_topk=1,
+    num_kv_heads=1,
+    max_bs,
+):
+    """Size a backend's CUDA-graph buffers for max_bs verify requests;
+    return (backend, base) with the static base buffers the replay leaves."""
+    bs = len(seq_lens)
+    pool_size, max_pages = 8, 1024
+    _, cache_seqlens, cu_seqlens_q, cu_seqlens_k = _verify_round_layout(
+        seq_lens, num_draft_tokens
+    )
+    backend, _ = make_spec_backend(
+        num_draft_tokens, eagle_topk, num_kv_heads=num_kv_heads
+    )
+    backend.init_cuda_graph_state(max_bs, max_bs * num_draft_tokens)
+    for name in ("k1", "k2"):
+        pages = backend.decode_cuda_graph_metadata[f"{name}.table"].shape[1]
+        table = torch.arange(pool_size * pages, dtype=torch.int32).view(
+            pool_size, pages
+        )
+        setattr(backend, f"req_to_sparse_{name}_token", table)
+    base = SimpleNamespace(
+        cache_seqlens_int32=cache_seqlens,
+        max_seq_len_q=num_draft_tokens,
+        max_seq_len_k=int(cache_seqlens.max()),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=torch.zeros((bs, max_pages), dtype=torch.int32),
+    )
+    return backend, base
+
+
+def tree_mask_from_parents(parents):
+    """Ancestor-closure visibility square of one request's draft tree."""
+    num_draft_tokens = len(parents)
+    mask = torch.zeros((num_draft_tokens, num_draft_tokens), dtype=torch.bool)
+    for token in range(num_draft_tokens):
+        node = token
+        while node != -1:
+            mask[token, node] = True
+            node = parents[node]
+    return mask
+
+
+def visible_counts(*, mask, bs, num_draft_tokens):
+    """Causal-prefix popcount oracle of a staged visibility square."""
+    causal = torch.tril(
+        torch.ones(
+            (num_draft_tokens, num_draft_tokens), dtype=torch.bool, device=mask.device
+        )
+    )
+    return (
+        (mask.view(bs, num_draft_tokens, num_draft_tokens) & causal)
+        .sum(dim=-1, dtype=torch.int32)
+        .view(-1)
+    )
+
+
+def pack_custom_mask(seq_lens, squares, device="cpu"):
+    """Pack rows in EAGLE's custom_mask layout: prefix columns all-visible,
+    trailing square from the tree."""
+    rows = []
+    for seq_len, square in zip(seq_lens, squares):
+        num_draft_tokens = square.shape[0]
+        request = torch.ones(
+            (num_draft_tokens, seq_len + num_draft_tokens), dtype=torch.bool
+        )
+        request[:, seq_len:] = square
+        rows.append(request.view(-1))
+    return torch.cat(rows).to(device)
