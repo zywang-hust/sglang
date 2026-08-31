@@ -12,6 +12,23 @@ def _trunc_div(a, b):
     return a // b if a >= 0 else -(-a // b)
 
 
+def _stage1_inputs(context_len, query_len):
+    """Stage-1 inputs shared by the torch-reference and tight-prefill tests;
+    seeds context_len + query_len."""
+    torch.manual_seed(context_len + query_len)
+    n_heads, n_kv_heads, head_dim = 32, 2, 128
+    groups = n_heads // n_kv_heads
+    k1_len = _compressed_len(context_len, 32, 16)
+    k2_len = _compressed_len(context_len, 128, 64)
+    q = torch.randn(query_len, n_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k1 = torch.randn(k1_len, n_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k2 = torch.randn(k2_len, n_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    cu_q = torch.tensor([0, query_len], dtype=torch.int32, device="cuda")
+    cu_k1 = torch.tensor([0, k1_len], dtype=torch.int32, device="cuda")
+    cu_k2 = torch.tensor([0, k2_len], dtype=torch.int32, device="cuda")
+    return q, k1, k2, cu_q, cu_k1, cu_k2, groups
+
+
 def _ref_stage1(q, k1, k2, query_len):
     """Torch reference pinning the stage-1 score/normalization path.
     Mask limits intentionally mirror ``apply_mask_stage1``
@@ -46,17 +63,8 @@ def _ref_stage1(q, k1, k2, query_len):
 def test_stage1_matches_torch_reference(context_len, query_len):
     """In the retiled stage-1 kernel,
     query_len * 16 % 64 != 0 exercises partial 64-row query tiles."""
-    torch.manual_seed(context_len + query_len)
-    n_heads, n_kv_heads, head_dim = 32, 2, 128
-    groups = n_heads // n_kv_heads
+    q, k1, k2, cu_q, cu_k1, cu_k2, groups = _stage1_inputs(context_len, query_len)
     k1_len = _compressed_len(context_len, 32, 16)
-    k2_len = _compressed_len(context_len, 128, 64)
-    q = torch.randn(query_len, n_heads, head_dim, dtype=torch.bfloat16, device="cuda")
-    k1 = torch.randn(k1_len, n_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
-    k2 = torch.randn(k2_len, n_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
-    cu_q = torch.tensor([0, query_len], dtype=torch.int32, device="cuda")
-    cu_k1 = torch.tensor([0, k1_len], dtype=torch.int32, device="cuda")
-    cu_k2 = torch.tensor([0, k2_len], dtype=torch.int32, device="cuda")
 
     score = sgl.infllmv2_attn_stage1(
         q,
@@ -152,6 +160,59 @@ def test_varlen_segments_match_single_runs():
 
     for (lo, hi), single in zip(zip(starts, starts[1:]), expected):
         assert torch.equal(batch[:, lo:hi], single)
+
+
+@pytest.mark.parametrize("context_len", [6144, 6500, 8192, 98304])
+def test_tight_prefill_shape_preserves_selection(context_len):
+    """A tight max_seqlen_k, in the production form (context_len // 16),
+    must reproduce the fixed-shape stage-1 scores and the resulting block selection;
+    6500 adds a key axis that is not a 128 multiple."""
+    query_len = 17
+    q, k1, k2, cu_q, cu_k1, cu_k2, groups = _stage1_inputs(context_len, query_len)
+    cache_lens = torch.tensor(
+        [context_len - query_len], dtype=torch.int32, device="cuda"
+    )
+
+    def run_stage1(max_seqlen_k):
+        return sgl.infllmv2_attn_stage1(
+            q,
+            k1,
+            k2,
+            cu_seqlens_q=cu_q * groups,
+            cu_seqlens_k=cu_k1,
+            cu_seqlens_v=cu_k2,
+            max_seqlen_q=query_len * 16,
+            max_seqlen_k=max_seqlen_k,
+            causal=True,
+        )
+
+    # 131072 = deployed max_context_len (fixed-shape stage-1 and pooling width).
+    fixed_score = run_stage1(131072 // 16)
+    tight_score = run_stage1(context_len // 16)
+    assert torch.equal(tight_score, fixed_score[..., : tight_score.shape[-1]])
+
+    pooling_args = dict(
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k1,
+        cache_lens=cache_lens,
+        max_seqlen_q=query_len,
+        local_blocks=32,
+        init_blocks=1,
+        block_size=64,
+        stride=16,
+    )
+    fixed_blocks = sgl.max_pooling_1d_varlen(
+        fixed_score, max_context_len=131072, **pooling_args
+    )
+    tight_blocks = sgl.max_pooling_1d_varlen(
+        tight_score, max_context_len=context_len, **pooling_args
+    )
+
+    def topk(blocks):
+        # 96 = deployed sparse_topk (topk 64 + window_size 2048 // block_size 64).
+        return blocks.topk(96, dim=-1).indices.sort(-1).values
+
+    assert torch.equal(topk(tight_blocks), topk(fixed_blocks))
 
 
 if __name__ == "__main__":

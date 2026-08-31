@@ -224,6 +224,7 @@ def compressed_attention(
     cu_seqlens_k: torch.Tensor,
     cu_seqlens_k2: torch.Tensor,
     max_seqlen_q: int,
+    max_seqlen_k: int,
     max_context_len: int,
     init_blocks: int = 1,
     local_blocks: int = 2,
@@ -247,6 +248,7 @@ def compressed_attention(
         cu_seqlens_k: Cumulative sequence lengths for k, shape (batch_size + 1)
         cu_seqlens_k2: Cumulative sequence lengths for k2, shape (batch_size + 1)
         max_seqlen_q: Maximum sequence length in query
+        max_seqlen_k: Maximum key sequence length in the batch, in tokens
         init_blocks: Number of initial blocks to always attend to
         local_blocks: Number of local blocks to consider
         cache_lens: Cache lengths for each batch (optional)
@@ -265,6 +267,14 @@ def compressed_attention(
             if cache_lens is None:
                 cache_lens = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
 
+        # With >= topk live blocks no padded tail can be selected;
+        # decode keeps static shapes for CUDA graphs.
+        selection_context_len = (
+            max(max_seqlen_k, topk * block_size) if is_prefilling else max_context_len
+        )
+
+        # stage1 rounds this key axis up to 128 and pooling reads the same width,
+        # so both derive from selection_context_len.
         score = infllmv2_attn_stage1(
             q.contiguous(),
             k.contiguous(),
@@ -273,7 +283,7 @@ def compressed_attention(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_v=cu_seqlens_k2,
             max_seqlen_q=max_seqlen_q_adjusted,
-            max_seqlen_k=max_context_len // kernel_stride,
+            max_seqlen_k=selection_context_len // kernel_stride,
             causal=is_prefilling,
         )
 
@@ -283,7 +293,7 @@ def compressed_attention(
             cu_seqlens_k,
             cache_lens,
             max_seqlen_q,
-            max_context_len,
+            selection_context_len,
             local_blocks=local_blocks,
             init_blocks=init_blocks,
             block_size=block_size,

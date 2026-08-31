@@ -556,12 +556,19 @@ class MiniCPMSparseBackend(AttentionBackend):
         cache_lens = None
         if max_seqlen_in_batch_k > max_seqlen_in_batch_q:
             if max_seqlen_in_batch_q == 1:
+                # Decode: one query token per segment, so the staged stage-1
+                # lens (cache length excluding the current token) already
+                # equal seq_lens_k - seq_lens_q.
                 cache_lens = self.forward_metadata.cache_seqlens_int32_stage1
             else:
+                # Extend over a cached prefix: per-segment kv positions
+                # that precede this chunk's queries.
                 seq_lens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
                 seq_lens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
                 cache_lens = seq_lens_k - seq_lens_q
         else:
+            # No segment caches kv beyond its query span,
+            # so the pooled block gate needs no per-segment cache bound.
             batch_size = cu_seqlens_q.shape[0] - 1
             cache_lens = torch.zeros(
                 batch_size, dtype=torch.int32, device=cu_seqlens_q.device
@@ -579,6 +586,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens,
                 compressed_cu_seqlens2,
                 max_seqlen_in_batch_q,
+                max_seqlen_in_batch_k,
                 self.max_context_len,
                 init_blocks=self.init_blocks,
                 local_blocks=self.local_blocks,
