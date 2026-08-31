@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.attention.minicpm_qknorm_rope import minicpm_qknorm_rope
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -32,7 +33,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import (
+    MRotaryEmbedding,
+    RotaryEmbedding,
+    get_rope,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -300,6 +305,18 @@ class MiniCPMLightningMixer(nn.Module):
                 rope_scaling=rope_scaling,
             )
 
+        # The fused kernel hard-codes neox full-head rotation on fp32 cos_sin_cache;
+        # mrope's per-section forward and the fallback kernel's dtype cast differ.
+        self.use_fused_qknorm_rope = (
+            self.qk_norm
+            and self.use_rope
+            and isinstance(self.rotary_emb, RotaryEmbedding)
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and not self.rotary_emb.use_fallback_kernel
+        )
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -320,20 +337,35 @@ class MiniCPMLightningMixer(nn.Module):
             return hidden_states.new_empty(hidden_states.shape[0], self.hidden_size)
 
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.qk_norm:
-            q = self.q_norm(q.reshape(-1, self.head_dim))
-            k = self.k_norm(k.reshape(-1, self.head_dim))
+        if self.use_fused_qknorm_rope:
+            q, k, v = minicpm_qknorm_rope(
+                qkv=qkv,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+                num_q_heads=self.num_heads,
+                num_k_heads=self.num_kv_heads,
+                num_v_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                eps=self.q_norm.variance_epsilon,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.use_rope:
-            q = q.reshape(-1, self.num_heads * self.head_dim)
-            k = k.reshape(-1, self.num_kv_heads * self.head_dim)
-            q, k = self.rotary_emb(positions, q, k)
+            if self.qk_norm:
+                q = self.q_norm(q.reshape(-1, self.head_dim))
+                k = self.k_norm(k.reshape(-1, self.head_dim))
 
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+            if self.use_rope:
+                q = q.reshape(-1, self.num_heads * self.head_dim)
+                k = k.reshape(-1, self.num_kv_heads * self.head_dim)
+                q, k = self.rotary_emb(positions, q, k)
+
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            v = v.reshape(-1, self.num_kv_heads, self.head_dim)
 
         o = self.attn(q, k, v, forward_batch)
 
