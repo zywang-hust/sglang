@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -7,6 +8,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.lightning_attention import (
     LightningAttentionCase,
+    build_lightning_attention_fixture,
     make_lightning_cases,
     run_lightning_attention_case,
 )
@@ -19,9 +21,9 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -244,6 +246,24 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
                 run_lightning_eagle_verify_case(
                     self, case, topk=topk, spec_kind=spec_kind
                 )
+
+    def test_verify_state_indices_stay_inside_the_state_scratch(self):
+        """A verify forward slices the state-index table by the batch row count;
+        on an attn-tp padded batch those rows reach past the request pool and
+        must map onto the speculative state scratch's padding row."""
+        case = self.EAGLE_VERIFY_CASES[0][0]
+        padding_rows = 2
+        with patch(
+            "sglang.srt.utils.common.get_eager_max_batch_size",
+            side_effect=lambda pool_size: pool_size + padding_rows,
+        ):
+            fixture = build_lightning_attention_fixture(self, case)
+        req_to_token_pool = fixture.runner.req_to_token_pool
+        padded_bs = req_to_token_pool.size + padding_rows
+        scratch = req_to_token_pool.mamba2_layer_cache(0).intermediate_ssm
+        indices = fixture.backend.verify_intermediate_state_indices[:padded_bs]
+        self.assertEqual(indices.numel(), padded_bs)
+        self.assertLess(int(indices.max()), scratch.shape[0])
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:

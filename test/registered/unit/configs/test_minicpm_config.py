@@ -26,7 +26,7 @@ from sglang.srt.models.minicpm import (
     MiniCPMDecoderLayer,
     MiniCPMLightningMixer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -277,6 +277,7 @@ def test_non_lightning_minicpm_is_not_classified_as_linear_attention():
 def test_lightning_backend_reads_structural_linear_config(monkeypatch):
     def fake_base_init(self, model_runner):
         self.topk = 1
+        self.req_to_token_pool = model_runner.req_to_token_pool
 
     monkeypatch.setattr(MambaAttnBackendBase, "__init__", fake_base_init)
     config = SimpleNamespace(
@@ -287,9 +288,10 @@ def test_lightning_backend_reads_structural_linear_config(monkeypatch):
     )
     model_runner = SimpleNamespace(
         req_to_token_pool=SimpleNamespace(
+            size=0,
             mamba_pool=SimpleNamespace(
                 mamba_cache=SimpleNamespace(conv=[torch.empty(0)])
-            )
+            ),
         ),
         sliding_window_size=None,
         model_config=SimpleNamespace(
@@ -303,7 +305,10 @@ def test_lightning_backend_reads_structural_linear_config(monkeypatch):
         kv_cache_dtype_str="float32",
     )
 
-    with get_parallel().override(attn_tp_size=1, attn_tp_rank=0):
+    with (
+        get_context().override_server_args(),
+        get_parallel().override(attn_tp_size=1, attn_tp_rank=0),
+    ):
         backend = LightningAttentionBackend(model_runner)
 
     assert [slope.shape for slope in backend.tp_slope] == [(4, 1, 1), (4, 1, 1)]

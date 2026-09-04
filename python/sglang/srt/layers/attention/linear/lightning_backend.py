@@ -12,6 +12,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBack
 from sglang.srt.layers.attention.linear.linear_metadata import (
     BailingLinearMetadata,
 )
+from sglang.srt.layers.attention.linear.utils import (
+    build_verify_intermediate_state_indices,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -42,6 +45,13 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
+        self.verify_intermediate_state_indices = (
+            build_verify_intermediate_state_indices(
+                self.req_to_token_pool.size,
+                model_runner.device,
+            )
+        )
         # seg_la processes draft tokens as a chain -- it has no parent-indices
         # plumbing for tree-shaped drafts, so spec v2 tree verify (topk > 1) would
         # commit wrong mamba states silently. Fail fast instead of mis-decoding.
@@ -383,11 +393,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             )
         elif self.linear_backend == "seg_la":
             intermediate_state_indices = (
-                torch.arange(
-                    cache_indices.shape[0],
-                    dtype=torch.int32,
-                    device=cache_indices.device,
-                )
+                self.verify_intermediate_state_indices[: cache_indices.shape[0]]
                 if forward_batch.forward_mode.is_target_verify()
                 else None
             )
