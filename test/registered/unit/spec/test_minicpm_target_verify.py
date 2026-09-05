@@ -1,11 +1,12 @@
-"""MiniCPM sparse target-verify: row planning, segment layouts, and verify
-metadata construction."""
+"""MiniCPM sparse target-verify: row planning, segment layouts,
+verify metadata construction, and graph buffers."""
 
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.minicpm_fixtures import (
@@ -18,7 +19,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.attention.minicpm import backend as backend_module
+from sglang.srt.layers.attention.minicpm.backend import _copy_dense_page_table
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
+    _build_dense_verify_overwrite,
     _build_sparse_decode_metadata,
     _plan_repeated_segments,
 )
@@ -149,6 +152,37 @@ class TestPlanRepeatedSegments(CustomTestCase):
         want = torch.cat([flat[0:2]] * 3 + [flat[2:5]] * 3)
         self.assertTrue(torch.equal(flat.index_select(0, layout.index), want))
 
+    def test_slab_segment_starts_gather_packed_rows(self):
+        """A layout planned over slab offsets must gather, from a slab-laid buffer,
+        what the packed layout gathers from a packed one, with equal row bounds."""
+        segment_rows, num_draft_tokens = 8, 3
+        chunk_lens = torch.tensor([3, 8, 0, 5], dtype=torch.int32)
+        packed_cu = F.pad(torch.cumsum(chunk_lens, dim=0, dtype=torch.int32), (1, 0))
+        total = int(packed_cu[-1])
+        packed = torch.arange(total, dtype=torch.float32)
+        slab = torch.full((len(chunk_lens) * segment_rows,), float("nan"))
+        slab_starts = torch.arange(len(chunk_lens), dtype=torch.int32) * segment_rows
+        for batch_idx, n in enumerate(chunk_lens.tolist()):
+            start = batch_idx * segment_rows
+            slab[start : start + n] = packed[
+                packed_cu[batch_idx] : packed_cu[batch_idx + 1]
+            ]
+
+        packed_layout = _plan_repeated_segments(
+            packed_cu, total_tokens=total, repeats=num_draft_tokens
+        )
+        slab_layout = _plan_repeated_segments(
+            packed_cu,
+            total_tokens=total,
+            repeats=num_draft_tokens,
+            segment_starts=slab_starts,
+        )
+
+        self.assertTrue(torch.equal(slab_layout.cu_seqlens, packed_layout.cu_seqlens))
+        self.assertTrue(
+            torch.equal(slab[slab_layout.index], packed[packed_layout.index])
+        )
+
 
 def _verify_forward_batch(seq_lens, num_draft_tokens, spec_info=None):
     forward_batch, base_metadata = make_verify_batch(seq_lens, num_draft_tokens)
@@ -234,6 +268,70 @@ class TestBackendVerifyMetadata(CustomTestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, "draft extend"):
             backend.init_forward_metadata(forward_batch)
+
+
+class TestVerifyGraphBuffers(CustomTestCase):
+
+    def test_dense_overwrite_matches_python_loop(self):
+        """The masked overwrite must write, exactly,
+        what the eager _copy_dense_page_table loop writes and nothing else."""
+        num_draft_tokens = 3
+        backend, _ = make_spec_backend(
+            num_draft_tokens=num_draft_tokens, eagle_topk=1, num_kv_heads=2
+        )
+        hg = backend.head_group_num
+        seq_lens = [60, 126, 500]
+        bs = len(seq_lens)
+        width = max(backend.dense_len, backend.num_sparse_topk_tokens)
+        generator = torch.Generator().manual_seed(0)
+        page_table = torch.randint(
+            0, 500, (bs, 1024), dtype=torch.int32, generator=generator
+        )
+        original = torch.randint(
+            0,
+            500,
+            (bs * num_draft_tokens * hg, width),
+            dtype=torch.int32,
+            generator=generator,
+        )
+        token_pos_in_bs = torch.tensor(
+            [s + d + 1 for s in seq_lens for d in range(num_draft_tokens)],
+            dtype=torch.int32,
+        )
+        token_to_bs = torch.repeat_interleave(
+            torch.arange(bs, dtype=torch.int32), num_draft_tokens
+        )
+        dense_rows, dense_mask = _build_dense_verify_overwrite(
+            token_pos_in_bs,
+            token_to_bs,
+            page_table,
+            dense_len=backend.dense_len,
+            head_group_num=hg,
+        )
+        metadata = SimpleNamespace(
+            sparse_page_table=original.clone(),
+            verify_dense_rows=dense_rows,
+            verify_dense_mask=dense_mask,
+        )
+        reference = original.clone()
+        for batch_idx, seq_len in enumerate(seq_lens):
+            for draft_idx in range(num_draft_tokens):
+                kv_len = seq_len + draft_idx + 1
+                if kv_len < backend.dense_len:
+                    _copy_dense_page_table(
+                        reference,
+                        (batch_idx * num_draft_tokens + draft_idx) * hg,
+                        page_table,
+                        batch_idx,
+                        kv_len,
+                        hg,
+                    )
+
+        backend._overwrite_dense_verify_rows(metadata)
+
+        self.assertTrue(torch.equal(metadata.sparse_page_table, reference))
+        # The batch spans both regimes, so some rows must actually change.
+        self.assertFalse(torch.equal(reference, original))
 
 
 class TestFusedTopkRepeatGate(CustomTestCase):
