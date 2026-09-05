@@ -3,7 +3,7 @@ the eager sparse-verify builders are the reference."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
@@ -23,11 +23,16 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
+from sglang.srt.layers.attention.minicpm.sparse_kernels import (
+    fill_compress_level_metadata,
+    fill_repeated_segments,
+)
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     MiniCPMSparseMetadata,
     _build_k1_k2_compression_metadata,
     _build_sparse_verify_rows,
     _build_tree_verify_base_geometry,
+    _compute_single_compression_metadata,
     _plan_repeated_segments,
 )
 
@@ -620,13 +625,11 @@ class TestVerifyGraphReplay(CustomTestCase):
         backend._bind_sparse_verify_graph_metadata(
             capture_batch, MiniCPMSparseMetadata(base=base), in_capture=True
         )
-        # FA's topk>1 replay refresh leaves the two-phase tree layout in the
-        # static base buffers: prefix-only cache lengths and page-table rows.
-        prefix = torch.tensor(padded_seq_lens, dtype=torch.int32, device=DEVICE)
-        base.cache_seqlens_int32.copy_(prefix)
-        base.cu_seqlens_k.copy_(
-            F.pad(torch.cumsum(prefix, dim=0, dtype=torch.int32), (1, 0))
-        )
+        # FA's verify replay is bypassed for trees,
+        # so base buffers arrive stale; simulate that.
+        base.cache_seqlens_int32.fill_(7777)
+        # cu_seqlens_k[0] is written once at capture and never again.
+        base.cu_seqlens_k[1:].fill_(7777)
         base.page_table.zero_()
 
         forward_batch, metadata = _replay_verify_graph(
@@ -700,6 +703,139 @@ class TestVerifyGraphReplay(CustomTestCase):
         self._assert_repeat_layouts_match_eager(
             backend, metadata, eager_levels, real_bs, num_draft_tokens
         )
+
+    def test_tree_replay_binds_flash_attention_capture_struct(self):
+        """A tree replay must reuse the per-bs metadata FlashAttention registered at
+        capture and skip FA's own replay fill; that fill rewrites the same storage
+        _replay_sparse_verify_graph_metadata owns."""
+        num_draft_tokens = 2
+        seq_lens = [100, 130]
+        bs = len(seq_lens)
+        backend, base = make_replay_backend(
+            seq_lens, num_draft_tokens, max_bs=bs, eagle_topk=2, device=DEVICE
+        )
+        flash_attn_backend = backend.flash_attn_backend
+        flash_attn_backend.target_verify_metadata_topk_normal = {bs: base}
+        flash_attn_backend.init_forward_metadata_out_graph = Mock()
+        square = tree_mask_from_parents([-1, 0])
+        custom_mask = pack_custom_mask(seq_lens, [square] * bs, device=DEVICE)
+        backend._bind_sparse_verify_graph_metadata(
+            SimpleNamespace(batch_size=bs, spec_info=None),
+            MiniCPMSparseMetadata(base=base),
+            in_capture=True,
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=bs,
+            num_padding=0,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE),
+            seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32),
+            req_pool_indices=torch.tensor([2, 5], device=DEVICE),
+            spec_info=SimpleNamespace(custom_mask=custom_mask),
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: True,
+                is_decode_or_idle=lambda: False,
+            ),
+        )
+
+        backend.init_forward_metadata_out_graph(forward_batch, in_capture=False)
+
+        self.assertIs(backend.forward_metadata.base, base)
+        flash_attn_backend.init_forward_metadata_out_graph.assert_not_called()
+
+
+class TestCompressLevelMetadataKernel(CustomTestCase):
+    def test_bit_exact_against_host_builder(self):
+        """Pin fill_compress_level_metadata bitwise to the host level builder,
+        across seq_len below/at/past kernel_size, stride-aligned and mid-stride,
+        chain and rolled-back tree boundaries."""
+        kernel_size, kernel_stride, num_draft_tokens = 32, 16, 7
+        seq_lens = [0, 1, 24, 25, 31, 32, 33, 47, 48, 100, 129]
+        real_bs = len(seq_lens)
+        bs = real_bs + 2  # padded lanes
+        seq = torch.tensor(seq_lens + [1, 1], dtype=torch.int32, device=DEVICE)
+        for prefix_delta in (0, -num_draft_tokens):
+            history = torch.full((bs,), -9, dtype=torch.int32, device=DEVICE)
+            cu_seqlens = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+            cu_new = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+            fill_compress_level_metadata(
+                seq_lens=seq,
+                history_out=history,
+                cu_seqlens_out=cu_seqlens,
+                cu_new_token_out=cu_new,
+                full_delta=num_draft_tokens,
+                prefix_delta=prefix_delta,
+                kernel_size=kernel_size,
+                kernel_stride=kernel_stride,
+                real_bs=real_bs,
+                bs=bs,
+            )
+            full = seq[:real_bs] + num_draft_tokens
+            want = _compute_single_compression_metadata(
+                seq_lens_cpu=full.cpu(),
+                token_nums=full,
+                history_lens=seq[:real_bs] + prefix_delta,
+                req_pool_indices=torch.arange(real_bs, device=DEVICE),
+                req_to_sparse_token=torch.zeros(
+                    (real_bs, 1), dtype=torch.int32, device=DEVICE
+                ),
+                kernel_size=kernel_size,
+                kernel_stride=kernel_stride,
+            )
+            self.assertTrue(
+                torch.equal(history[:real_bs], want.history_compress_token_nums),
+                prefix_delta,
+            )
+            self.assertTrue((history[real_bs:] == 0).all())
+            for got, exp in (
+                (cu_seqlens, want.cu_seqlens),
+                (cu_new, want.cu_new_token_nums),
+            ):
+                self.assertTrue(torch.equal(got[: real_bs + 1], exp), prefix_delta)
+                self.assertTrue((got[real_bs + 1 :] == exp[-1]).all(), prefix_delta)
+
+
+class TestRepeatedSegmentsKernel(CustomTestCase):
+    def test_bit_exact_against_host_planner(self):
+        """Pin fill_repeated_segments bitwise to _plan_repeated_segments over slab
+        offsets, with an empty request, a full slab and padded rows; the index
+        tail past the packed rows reads as row 0."""
+        segment_rows, repeats = 8, 3
+        chunk_lens = [3, 8, 0, 5]
+        real_bs = len(chunk_lens)
+        bs = real_bs + 1  # padded lane with a flat cumsum tail
+        cu_seqlens = F.pad(
+            torch.cumsum(
+                torch.tensor(chunk_lens + [0], dtype=torch.int32, device=DEVICE),
+                dim=0,
+                dtype=torch.int32,
+            ),
+            (1, 0),
+        )
+        segment_starts = torch.arange(bs + 1, dtype=torch.int32, device=DEVICE)
+        segment_starts *= segment_rows
+        index = torch.full(
+            (bs * repeats * segment_rows,), -1, dtype=torch.int64, device=DEVICE
+        )
+        cu_seqlens_out = torch.zeros(bs * repeats + 1, dtype=torch.int32, device=DEVICE)
+
+        fill_repeated_segments(
+            cu_seqlens=cu_seqlens,
+            segment_starts=segment_starts,
+            index_out=index,
+            cu_seqlens_out=cu_seqlens_out,
+            repeats=repeats,
+            segment_rows=segment_rows,
+        )
+
+        want = _plan_repeated_segments(
+            cu_seqlens,
+            total_tokens=sum(chunk_lens),
+            repeats=repeats,
+            segment_starts=segment_starts[:-1],
+        )
+        self.assertTrue(torch.equal(cu_seqlens_out, want.cu_seqlens))
+        self.assertTrue(torch.equal(index[: want.index.numel()], want.index))
+        self.assertTrue((index[want.index.numel() :] == 0).all())
 
 
 if __name__ == "__main__":

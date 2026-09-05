@@ -42,7 +42,7 @@ def make_runner_scaffold(
     before patching in the backend."""
     kernel_size, kernel_stride = 32, 16
     # attach_compressed_cache is stubbed out here, so the scaffold sizes the K1/K2
-    # tables the way cache.py does.
+    # tables the way cache.py does; the graph buffers assert on that width.
     req_pool = SimpleNamespace(
         req_to_sparse_k1_token=_sparse_token_table(
             pages=(max_context_len - kernel_size) // kernel_stride + 1, device=device
@@ -51,9 +51,9 @@ def make_runner_scaffold(
             pages=(max_context_len - kernel_size * 4) // (kernel_stride * 4) + 1,
             device=device,
         ),
-        req_to_token=torch.arange(8 * 1024, dtype=torch.int32, device=device).view(
-            8, 1024
-        ),
+        req_to_token=torch.arange(
+            POOL_SIZE * 1024, dtype=torch.int32, device=device
+        ).view(POOL_SIZE, 1024),
     )
     flash_attn_backend = SimpleNamespace(
         max_context_len=max_context_len,
