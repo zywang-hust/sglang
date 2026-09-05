@@ -22,6 +22,7 @@ from torch import nn
 
 from sglang.kernels.ops.attention.minicpm_qknorm_rope import minicpm_qknorm_rope
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -251,6 +252,7 @@ class MiniCPMLightningMixer(nn.Module):
         self.use_output_gate = use_output_gate
         self.attention_bias = attention_bias
         self.rms_norm_eps = rms_norm_eps
+        self.tp_size = tp_size
         self.use_rope = use_rope
         self.qk_norm = qk_norm
         self.use_output_norm = use_output_norm
@@ -370,7 +372,19 @@ class MiniCPMLightningMixer(nn.Module):
         o = self.attn(q, k, v, forward_batch)
 
         if self.use_output_norm:
-            o = self.o_norm(o)
+            if self.tp_size == 1:
+                o = self.o_norm(o)
+            else:
+                # Output RMS statistics span the full head dimension across TP ranks.
+                output_dtype = o.dtype
+                o = o.float()
+                variance = o.square().mean(dim=-1, keepdim=True)
+                variance = tensor_model_parallel_all_reduce(variance) / self.tp_size
+                o = (
+                    o
+                    * torch.rsqrt(variance + self.o_norm.variance_epsilon)
+                    * self.o_norm.weight
+                ).to(output_dtype)
 
         if self.use_output_gate:
             z, _ = self.z_proj(hidden_states)
