@@ -390,6 +390,13 @@ def compressed_attention_tilelang(
         return topk_idx
 
 
+class CompressLevel(msgspec.Struct):
+    name: str
+    kernel_size: int
+    kernel_stride: int
+    token_table: torch.Tensor
+
+
 class CompressionLevelMetadata(msgspec.Struct):
     """Metadata for a single compression level (k1 or k2).
 
@@ -567,13 +574,9 @@ def _compute_single_compression_metadata(
 def _build_k1_k2_compression_metadata(
     req_pool_indices: torch.Tensor,
     base_metadata: FlashAttentionMetadata,
-    req_to_sparse_k1_token: torch.Tensor,
-    req_to_sparse_k2_token: torch.Tensor,
-    k1_kernel_size: int,
-    k1_kernel_stride: int,
-    k2_kernel_size: int,
-    k2_kernel_stride: int,
     seq_lens_cpu: torch.Tensor,
+    *,
+    levels: tuple[CompressLevel, ...],
     history_lens: Optional[torch.Tensor] = None,
 ) -> tuple[CompressionLevelMetadata, CompressionLevelMetadata]:
     seq_lens_cpu = torch.as_tensor(
@@ -600,14 +603,11 @@ def _build_k1_k2_compression_metadata(
             token_nums,
             history_lens,
             req_pool_indices,
-            req_to_sparse_token,
-            kernel_size,
-            kernel_stride,
+            level.token_table,
+            level.kernel_size,
+            level.kernel_stride,
         )
-        for req_to_sparse_token, kernel_size, kernel_stride in (
-            (req_to_sparse_k1_token, k1_kernel_size, k1_kernel_stride),
-            (req_to_sparse_k2_token, k2_kernel_size, k2_kernel_stride),
-        )
+        for level in levels
     )
 
 

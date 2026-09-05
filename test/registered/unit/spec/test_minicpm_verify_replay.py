@@ -147,12 +147,7 @@ class TestVerifyGraphReplay(CustomTestCase):
         expected = _build_k1_k2_compression_metadata(
             req_pool_indices=forward_batch.req_pool_indices[:real_bs],
             base_metadata=eager_base,
-            req_to_sparse_k1_token=backend.req_to_sparse_k1_token,
-            req_to_sparse_k2_token=backend.req_to_sparse_k2_token,
-            k1_kernel_size=backend.k1_kernel_size,
-            k1_kernel_stride=backend.k1_kernel_stride,
-            k2_kernel_size=backend.k2_kernel_size,
-            k2_kernel_stride=backend.k2_kernel_stride,
+            levels=backend.compress_levels,
             seq_lens_cpu=torch.tensor(real_seq_lens, dtype=torch.int32)
             + num_draft_tokens,
             history_lens=history_lens,

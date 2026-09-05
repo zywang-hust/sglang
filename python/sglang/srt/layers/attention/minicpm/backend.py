@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.minicpm.sparse_kernels import (
 )
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     CompressionLevelMetadata,
+    CompressLevel,
     MiniCPMSparseMetadata,
     RepeatedSegmentLayout,
     _assign_row_metadata,
@@ -244,6 +245,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.k1_kernel_stride = self.kernel_stride
         self.k2_kernel_size = self.kernel_size * 4
         self.k2_kernel_stride = self.kernel_stride * 4
+        self._init_compress_levels()
 
         self._init_spec_decode_config()
 
@@ -253,7 +255,9 @@ class MiniCPMSparseBackend(AttentionBackend):
         # The fused top-k scores on the k1 level alone,
         # so the k2 repeat layout has no readers under minicpm_fuse_topk.
         self.verify_repeat_levels = frozenset(
-            name for name in ("k1", "k2") if name != "k2" or not self.minicpm_fuse_topk
+            level.name
+            for level in self.compress_levels
+            if level.name != "k2" or not self.minicpm_fuse_topk
         )
         dtype_str = str(self.model_dtype).removeprefix("torch.")
         if self.minicpm_fuse_topk and dtype_str not in ("bfloat16", "float16"):
@@ -363,6 +367,22 @@ class MiniCPMSparseBackend(AttentionBackend):
                 f"got {window_tokens}."
             )
 
+    def _init_compress_levels(self):
+        self.compress_levels = (
+            CompressLevel(
+                name="k1",
+                kernel_size=self.k1_kernel_size,
+                kernel_stride=self.k1_kernel_stride,
+                token_table=self.req_to_sparse_k1_token,
+            ),
+            CompressLevel(
+                name="k2",
+                kernel_size=self.k2_kernel_size,
+                kernel_stride=self.k2_kernel_stride,
+                token_table=self.req_to_sparse_k2_token,
+            ),
+        )
+
     def _get_fused_topk_kernel(self, batch_size: int, *, is_prefill: bool):
         if not self.minicpm_fuse_topk:
             return None
@@ -392,12 +412,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         metadata.k1, metadata.k2 = _build_k1_k2_compression_metadata(
             req_pool_indices=forward_batch.req_pool_indices,
             base_metadata=metadata.base,
-            req_to_sparse_k1_token=self.req_to_sparse_k1_token,
-            req_to_sparse_k2_token=self.req_to_sparse_k2_token,
-            k1_kernel_size=self.k1_kernel_size,
-            k1_kernel_stride=self.k1_kernel_stride,
-            k2_kernel_size=self.k2_kernel_size,
-            k2_kernel_stride=self.k2_kernel_stride,
+            levels=self.compress_levels,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
@@ -451,12 +466,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         metadata.k1, metadata.k2 = _build_k1_k2_compression_metadata(
             req_pool_indices=forward_batch.req_pool_indices,
             base_metadata=metadata.base,
-            req_to_sparse_k1_token=self.req_to_sparse_k1_token,
-            req_to_sparse_k2_token=self.req_to_sparse_k2_token,
-            k1_kernel_size=self.k1_kernel_size,
-            k1_kernel_stride=self.k1_kernel_stride,
-            k2_kernel_size=self.k2_kernel_size,
-            k2_kernel_stride=self.k2_kernel_stride,
+            levels=self.compress_levels,
             seq_lens_cpu=forward_batch.seq_lens_cpu + num_draft_tokens,
             history_lens=history_lens,
         )
@@ -1271,21 +1281,20 @@ class MiniCPMSparseBackend(AttentionBackend):
 
     def _init_compression_graph_buffers(self, max_bs: int):
         buffers = self.decode_cuda_graph_metadata
-        for name, kernel_size, kernel_stride in (
-            ("k1", self.k1_kernel_size, self.k1_kernel_stride),
-            ("k2", self.k2_kernel_size, self.k2_kernel_stride),
-        ):
+        for level in self.compress_levels:
+            name = level.name
             max_num_pages = (
                 max(
                     0,
-                    (self.max_context_len - kernel_size) // kernel_stride + 1,
+                    (self.max_context_len - level.kernel_size) // level.kernel_stride
+                    + 1,
                 )
                 + self.page_size
                 - 1
             ) // self.page_size
             buffers[f"compress_{name}"] = torch.zeros(
                 (
-                    max_bs * self.max_context_len // kernel_stride,
+                    max_bs * self.max_context_len // level.kernel_stride,
                     self.head_group_num,
                     self.head_dim,
                 ),
@@ -1306,7 +1315,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                 max_verify_tokens = max_bs * self.speculative_num_draft_tokens
                 buffers[f"{name}_repeat"] = RepeatedSegmentLayout(
                     index=torch.zeros(
-                        max_verify_tokens * (self.max_context_len // kernel_stride),
+                        max_verify_tokens
+                        * (self.max_context_len // level.kernel_stride),
                         dtype=torch.int64,
                         device=self.device,
                     ),
@@ -1387,12 +1397,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         compression_metadata = _build_k1_k2_compression_metadata(
             req_pool_indices=req_pool_indices,
             base_metadata=metadata.base,
-            req_to_sparse_k1_token=self.req_to_sparse_k1_token,
-            req_to_sparse_k2_token=self.req_to_sparse_k2_token,
-            k1_kernel_size=self.k1_kernel_size,
-            k1_kernel_stride=self.k1_kernel_stride,
-            k2_kernel_size=self.k2_kernel_size,
-            k2_kernel_stride=self.k2_kernel_stride,
+            levels=self.compress_levels,
             seq_lens_cpu=seq_lens_cpu,
         )
         return decode_metadata, compression_metadata
@@ -1446,51 +1451,44 @@ class MiniCPMSparseBackend(AttentionBackend):
         in_capture: bool,
         assume_kv_len: int,
     ):
-        metadata.k1 = self._bind_compression_level(
-            "k1",
-            kernel_size=self.k1_kernel_size,
-            kernel_stride=self.k1_kernel_stride,
-            bs=bs,
-            in_capture=in_capture,
-            assume_kv_len=assume_kv_len,
-        )
-        metadata.k2 = self._bind_compression_level(
-            "k2",
-            kernel_size=self.k2_kernel_size,
-            kernel_stride=self.k2_kernel_stride,
-            bs=bs,
-            in_capture=in_capture,
-            assume_kv_len=assume_kv_len,
+        metadata.k1, metadata.k2 = (
+            self._bind_compression_level(
+                level, bs=bs, in_capture=in_capture, assume_kv_len=assume_kv_len
+            )
+            for level in self.compress_levels
         )
 
     def _bind_compression_level(
         self,
-        name: str,
+        level: CompressLevel,
         *,
-        kernel_size: int,
-        kernel_stride: int,
         bs: int,
         in_capture: bool,
         assume_kv_len: int,
     ) -> CompressionLevelMetadata:
         buffers = self.decode_cuda_graph_metadata
-        level = CompressionLevelMetadata()
-        level_len = max(0, (assume_kv_len - kernel_size) // kernel_stride + 1)
-        level.cu_seqlens_cpu = [index * level_len for index in range(bs + 1)]
-        level.cu_seqlens = buffers[f"{name}.cu_seqlens"][: bs + 1]
+        name = level.name
+        level_metadata = CompressionLevelMetadata()
+        level_len = max(
+            0, (assume_kv_len - level.kernel_size) // level.kernel_stride + 1
+        )
+        level_metadata.cu_seqlens_cpu = [index * level_len for index in range(bs + 1)]
+        level_metadata.cu_seqlens = buffers[f"{name}.cu_seqlens"][: bs + 1]
         if in_capture:
-            level.cu_seqlens.copy_(
+            level_metadata.cu_seqlens.copy_(
                 torch.arange(bs + 1, device=self.device, dtype=torch.int32) * level_len
             )
-        level.table = buffers[f"{name}.table"][:bs]
-        level.history_compress_token_nums = buffers[
+        level_metadata.table = buffers[f"{name}.table"][:bs]
+        level_metadata.history_compress_token_nums = buffers[
             f"{name}.history_compress_token_nums"
         ][:bs]
-        level.cu_new_token_nums = buffers[f"{name}.cu_new_token_nums"][: bs + 1]
-        level.cu_total_compress_token_nums = buffers[
+        level_metadata.cu_new_token_nums = buffers[f"{name}.cu_new_token_nums"][
+            : bs + 1
+        ]
+        level_metadata.cu_total_compress_token_nums = buffers[
             f"{name}.cu_total_compress_token_nums"
         ][: bs + 1]
-        return level
+        return level_metadata
 
     def _replay_sparse_graph_metadata(
         self,
@@ -1570,14 +1568,9 @@ class MiniCPMSparseBackend(AttentionBackend):
         cu_fields: tuple[str, ...],
     ):
         bs = forward_batch.batch_size
-        for (name, req_to_sparse), src in zip(
-            (
-                ("k1", self.req_to_sparse_k1_token),
-                ("k2", self.req_to_sparse_k2_token),
-            ),
-            compression_metadata,
+        for dst, level, src in zip(
+            (metadata.k1, metadata.k2), self.compress_levels, compression_metadata
         ):
-            dst = getattr(metadata, name)
             dst.history_compress_token_nums[:real_bs].copy_(
                 src.history_compress_token_nums
             )
@@ -1591,7 +1584,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                     # Padded rows get zero-length tails
                     # so the captured gathers stay in bounds.
                     dst_field[real_bs + 1 :].fill_(src_field[-1])
-            dst.table.copy_(req_to_sparse[forward_batch.req_pool_indices])
+            dst.table.copy_(level.token_table[forward_batch.req_pool_indices])
 
     def _bind_sparse_verify_graph_metadata(
         self,
@@ -1705,17 +1698,16 @@ class MiniCPMSparseBackend(AttentionBackend):
         bs: int,
         num_verify_tokens: int,
     ):
+        k1_level, k2_level = self.compress_levels
         metadata.k1_repeat = self._bind_verify_repeat_level(
             metadata.k1,
-            name="k1",
-            kernel_stride=self.k1_kernel_stride,
+            level=k1_level,
             bs=bs,
             num_verify_tokens=num_verify_tokens,
         )
         metadata.k2_repeat = self._bind_verify_repeat_level(
             metadata.k2,
-            name="k2",
-            kernel_stride=self.k2_kernel_stride,
+            level=k2_level,
             bs=bs,
             num_verify_tokens=num_verify_tokens,
         )
@@ -1724,12 +1716,11 @@ class MiniCPMSparseBackend(AttentionBackend):
         self,
         level_metadata: CompressionLevelMetadata,
         *,
-        name: str,
-        kernel_stride: int,
+        level: CompressLevel,
         bs: int,
         num_verify_tokens: int,
     ) -> Optional[RepeatedSegmentLayout]:
-        segment_rows = self.max_context_len // kernel_stride
+        segment_rows = self.max_context_len // level.kernel_stride
         packed_total = level_metadata.cu_seqlens_cpu[-1]
         level_metadata.cu_total_compress_token_nums.copy_(
             torch.arange(bs + 1, device=self.device, dtype=torch.int32) * segment_rows
@@ -1739,10 +1730,13 @@ class MiniCPMSparseBackend(AttentionBackend):
         level_metadata.cu_seqlens_cpu = [row * segment_rows for row in range(bs + 1)]
         # Mirror the eager planner: under minicpm_fuse_topk the k2 repeat is unset,
         # and the captured gather records the plain level cu_seqlens.
-        if name not in self.verify_repeat_levels:
+        if level.name not in self.verify_repeat_levels:
             return None
         repeat = self._verify_repeat_layout_views(
-            name, bs=bs, num_verify_tokens=num_verify_tokens, segment_rows=segment_rows
+            level.name,
+            bs=bs,
+            num_verify_tokens=num_verify_tokens,
+            segment_rows=segment_rows,
         )
         self._write_verify_repeat_layout(
             level_metadata, repeat, packed_total=packed_total
@@ -1906,12 +1900,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         compression_metadata = _build_k1_k2_compression_metadata(
             req_pool_indices=forward_batch.req_pool_indices[:real_bs],
             base_metadata=metadata.base,
-            req_to_sparse_k1_token=self.req_to_sparse_k1_token,
-            req_to_sparse_k2_token=self.req_to_sparse_k2_token,
-            k1_kernel_size=self.k1_kernel_size,
-            k1_kernel_stride=self.k1_kernel_stride,
-            k2_kernel_size=self.k2_kernel_size,
-            k2_kernel_stride=self.k2_kernel_stride,
+            levels=self.compress_levels,
             seq_lens_cpu=forward_batch.seq_lens_cpu[:real_bs] + num_draft_tokens,
             history_lens=history_lens,
         )
@@ -1924,18 +1913,17 @@ class MiniCPMSparseBackend(AttentionBackend):
             real_bs=real_bs,
             cu_fields=("cu_seqlens", "cu_new_token_nums"),
         )
-        for name, kernel_stride, level_metadata, src in (
-            ("k1", self.k1_kernel_stride, metadata.k1, compression_metadata[0]),
-            ("k2", self.k2_kernel_stride, metadata.k2, compression_metadata[1]),
+        for level, level_metadata, src in zip(
+            self.compress_levels, (metadata.k1, metadata.k2), compression_metadata
         ):
-            if name in self.verify_repeat_levels:
+            if level.name in self.verify_repeat_levels:
                 self._write_verify_repeat_layout(
                     level_metadata,
                     self._verify_repeat_layout_views(
-                        name,
+                        level.name,
                         bs=bs,
                         num_verify_tokens=bs * num_draft_tokens,
-                        segment_rows=self.max_context_len // kernel_stride,
+                        segment_rows=self.max_context_len // level.kernel_stride,
                     ),
                     packed_total=src.cu_seqlens_cpu[-1],
                 )

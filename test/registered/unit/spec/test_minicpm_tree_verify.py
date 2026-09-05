@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.minicpm.sparse_kernels import (
     fill_dense_page_table_rows,
 )
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
+    CompressLevel,
     _build_k1_k2_compression_metadata,
     compress_k_core_new,
 )
@@ -381,12 +382,20 @@ class TestTreeVerifyRecompression(CustomTestCase):
             k1, _ = _build_k1_k2_compression_metadata(
                 req_pool_indices=forward_batch.req_pool_indices,
                 base_metadata=base_metadata,
-                req_to_sparse_k1_token=req_to_sparse,
-                req_to_sparse_k2_token=req_to_sparse,
-                k1_kernel_size=kernel_size,
-                k1_kernel_stride=kernel_stride,
-                k2_kernel_size=kernel_size * 4,
-                k2_kernel_stride=kernel_stride * 4,
+                levels=(
+                    CompressLevel(
+                        name="k1",
+                        kernel_size=kernel_size,
+                        kernel_stride=kernel_stride,
+                        token_table=req_to_sparse,
+                    ),
+                    CompressLevel(
+                        name="k2",
+                        kernel_size=kernel_size * 4,
+                        kernel_stride=kernel_stride * 4,
+                        token_table=req_to_sparse,
+                    ),
+                ),
                 seq_lens_cpu=forward_batch.seq_lens_cpu + num_draft_tokens,
                 history_lens=history_lens,
             )
