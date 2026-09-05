@@ -1,3 +1,4 @@
+import torch
 import triton
 import triton.language as tl
 
@@ -196,3 +197,74 @@ def compress_k_complete_kernel_new(
 
         # Move to next chunk for this thread block
         chunk_in_seq += chunk_stride
+
+
+@triton.jit
+def _select_topk_blocks_kernel(
+    scores_ptr,
+    out_ptr,
+    num_blocks,
+    topk,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    valid = offs < num_blocks
+    score = tl.load(
+        scores_ptr + row * num_blocks + offs, mask=valid, other=float("-inf")
+    )
+    finite = score > float("-inf")
+    # Order-preserving unsigned image of the float bits, held in int64.
+    bits = score.to(tl.int32, bitcast=True)
+    ordered = tl.where(bits < 0, ~bits, bits ^ (-2147483648))
+    key = tl.where(finite, ordered.to(tl.int64) & 0xFFFFFFFF, 0)
+
+    bins = tl.arange(0, 256)
+    k_rem = tl.minimum(topk, tl.sum(finite.to(tl.int32), 0))
+    prefix = tl.zeros([1], dtype=tl.int64)
+    prefix = tl.sum(prefix, 0)
+    for shift in tl.static_range(24, -1, -8):
+        cand = finite & ((key >> (shift + 8)) == prefix)
+        digit = ((key >> shift) & 0xFF).to(tl.int32)
+        hist = tl.histogram(tl.where(cand, digit, 0), 256)
+        not_cand = tl.sum((~cand).to(tl.int32), 0)
+        hist = hist - tl.where(bins == 0, not_cand, 0)
+        cum_ge = tl.sum(hist, 0) - tl.cumsum(hist, 0) + hist
+        cum_gt = cum_ge - hist
+        hit = (cum_ge >= k_rem) & (cum_gt < k_rem)
+        k_rem = k_rem - tl.sum(tl.where(hit, cum_gt, 0), 0)
+        prefix = (prefix << 8) | tl.sum(tl.where(hit, bins, 0), 0).to(tl.int64)
+
+    above = finite & (key > prefix)
+    at = finite & (key == prefix)
+    # Resolve cutoff ties by block index; the prefix sum also preserves index order.
+    selected = above | (at & (tl.cumsum(at.to(tl.int32), 0) <= k_rem))
+    slot = tl.cumsum(selected.to(tl.int32), 0) - 1
+    tl.store(out_ptr + row * topk + slot, offs, mask=selected)
+    num_selected = tl.sum(selected.to(tl.int32), 0)
+    slots = tl.arange(0, BLOCK_K)
+    tl.store(
+        out_ptr + row * topk + slots,
+        -1,
+        mask=(slots >= num_selected) & (slots < topk),
+    )
+
+
+def select_topk_blocks(scores: torch.Tensor, *, topk: int) -> torch.Tensor:
+    """Top-k block indices of every row of ``scores`` ([..., num_blocks]
+    fp32), ascending, -1 padded; rows with -inf scores select fewer."""
+    num_blocks = scores.shape[-1]
+    rows = scores.numel() // num_blocks
+    out = torch.empty(
+        (*scores.shape[:-1], topk), dtype=torch.int32, device=scores.device
+    )
+    _select_topk_blocks_kernel[(rows,)](
+        scores,
+        out,
+        num_blocks,
+        topk,
+        BLOCK_N=triton.next_power_of_2(num_blocks),
+        BLOCK_K=triton.next_power_of_2(topk),
+    )
+    return out

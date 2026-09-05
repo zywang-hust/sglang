@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.minicpm.fuse_kernel import FusedTopkKernels
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 import triton
@@ -25,6 +26,7 @@ from sgl_kernel import infllmv2_attn_stage1, max_pooling_1d_varlen
 
 from sglang.srt.layers.attention.minicpm.sparse_kernels import (
     compress_k_complete_kernel_new,
+    select_topk_blocks,
 )
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
@@ -315,15 +317,14 @@ def compressed_attention_tilelang(
     k: torch.Tensor,
     block_size: int,
     topk: int,
-    kernel_topk: int,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     cache_lens=None,
-    fused_kernel=None,
+    fused_kernel: Optional[FusedTopkKernels] = None,
     max_cache_len=-1,
 ) -> torch.Tensor:
-    """Compute top-k block indices with the tilelang online-topk fused kernel
-    (the fused path scores on the k1 level alone)."""
+    """Compute top-k block indices with the tilelang fused kernels (the fused
+    path scores on the k1 level alone)."""
     with torch.no_grad():
         batch_size = cu_seqlens_q.shape[0] - 1
 
@@ -349,20 +350,6 @@ def compressed_attention_tilelang(
         # Compute actual output topk (same as original: min(topk, num_blocks))
         output_topk = min(topk, pooled_k_len)
 
-        # Allocate output tensors
-        topk_indices = torch.full(
-            (num_kv_heads, total_q_len, kernel_topk),
-            -1,
-            dtype=torch.int32,
-            device=q.device,
-        )
-        topk_values = torch.full(
-            (num_kv_heads, total_q_len, kernel_topk),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
         if cache_lens is None:
             cache_lens_tensor = torch.zeros(
                 batch_size, dtype=torch.int32, device=q.device
@@ -370,24 +357,35 @@ def compressed_attention_tilelang(
         else:
             cache_lens_tensor = cache_lens.to(torch.int32)
 
-        fused_kernel(
+        stats = torch.empty(
+            (num_kv_heads, total_q_len, groups, fused_kernel.k_splits, 2),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        pool_scores = torch.empty(
+            (num_kv_heads, total_q_len, fused_kernel.pooled_k_len),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        fused_kernel.stats(
             q_kernel,
             k_kernel,
             cu_seqlens_q,
             cu_seqlens_k,
             cache_lens_tensor,
-            topk_indices,
-            topk_values,
+            stats,
+        )
+        fused_kernel.scores(
+            q_kernel,
+            k_kernel,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cache_lens_tensor,
+            stats,
+            pool_scores,
         )
 
-        # Indices arrive sorted by descending score: truncate to output_topk
-        # before the index sort (-1 entries last).
-        large_val = pooled_k_len + 1000  # Any value larger than max valid index
-        sel = topk_indices[:, :, :output_topk]
-        topk_idx = torch.where(sel == -1, large_val, sel).sort(-1).values
-        topk_idx[topk_idx == large_val] = -1
-
-        return topk_idx
+        return select_topk_blocks(pool_scores, topk=output_topk)
 
 
 class CompressionLevelMetadata(msgspec.Struct):

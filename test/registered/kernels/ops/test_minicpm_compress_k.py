@@ -2,9 +2,12 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.minicpm.fuse_kernel import (
-    fused_attn_pooling_online_topk_decode,
+    build_fused_topk_kernels,
 )
-from sglang.srt.layers.attention.minicpm.sparse_utils import compress_k_core_new
+from sglang.srt.layers.attention.minicpm.sparse_utils import (
+    compress_k_core_new,
+    compressed_attention_tilelang,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -48,29 +51,27 @@ def test_compress_k_writes_each_head_once():
 
 
 def test_fused_decode_topk_skips_dense_rows():
-    kernel = fused_attn_pooling_online_topk_decode(
+    kernels = build_fused_topk_kernels(
+        is_causal=False,
+        k_splits=1,
         batch_size=2,
         groups=16,
         heads=16,
         dim=128,
-        topk=8,
         pooled_k_len=8,
         dense_len=5,
         dtype_str="bfloat16",
     )
-    topk_indices = torch.full((1, 2, 8), -1, dtype=torch.int32, device="cuda")
-    topk_values = torch.full(
-        (1, 2, 8), float("-inf"), dtype=torch.float32, device="cuda"
-    )
-
-    kernel(
-        torch.randn(32, 1, 128, dtype=torch.bfloat16, device="cuda"),
+    topk_indices = compressed_attention_tilelang(
+        torch.randn(2, 16, 128, dtype=torch.bfloat16, device="cuda"),
         torch.randn(4, 1, 128, dtype=torch.bfloat16, device="cuda"),
-        torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
-        torch.tensor([0, 2, 4], dtype=torch.int32, device="cuda"),
-        torch.tensor([3, 7], dtype=torch.int32, device="cuda"),
-        topk_indices,
-        topk_values,
+        64,
+        8,
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
+        cu_seqlens_k=torch.tensor([0, 2, 4], dtype=torch.int32, device="cuda"),
+        cache_lens=torch.tensor([3, 7], dtype=torch.int32, device="cuda"),
+        fused_kernel=kernels,
+        max_cache_len=8 * 64,
     )
 
     assert torch.all(topk_indices[:, 0] == -1)

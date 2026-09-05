@@ -22,7 +22,6 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_schedule,
 )
-from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -236,19 +235,8 @@ class MiniCPMSparseBackend(AttentionBackend):
         max_cache_len = self.max_context_len
         pooled_k_len = (max_cache_len + self.block_size - 1) // self.block_size
 
-        output_topk = min(self.sparse_topk, pooled_k_len)
-
-        # For the kernel, we need power of 2 topk
-        topk_power2 = next_power_of_2(output_topk)
-        kernel_topk = min(topk_power2, pooled_k_len)
-        # Make sure it's still power of 2
-        if kernel_topk != next_power_of_2(kernel_topk):
-            kernel_topk = next_power_of_2(kernel_topk) // 2
-        kernel_topk = max(8, kernel_topk)
-        self.kernel_topk = kernel_topk
         self.decode_fused_kernels = {}
         self.prefill_fused_kernels = {}
-        bucketed_pooled_k_len = next_power_of_2(pooled_k_len)
 
         pooling_block_stride = self.block_size // self.kernel_stride  # = 64 // 16 = 4
         pooling_pad_len = (
@@ -263,8 +251,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             "groups": self.heads_per_group,
             "heads": self.num_q_heads,
             "dim": self.head_dim,
-            "topk": self.kernel_topk,
-            "pooled_k_len": bucketed_pooled_k_len,
+            "pooled_k_len": pooled_k_len,
             "m_block_dim": self.heads_per_group,
             "block_M": self.heads_per_group,
             "block_stride": pooling_block_stride,
@@ -308,8 +295,8 @@ class MiniCPMSparseBackend(AttentionBackend):
             return None
 
         from sglang.srt.layers.attention.minicpm.fuse_kernel import (
-            fused_attn_pooling_online_topk_decode,
-            fused_attn_pooling_online_topk_prefill,
+            build_fused_topk_kernels,
+            decode_k_splits,
         )
 
         cache = self.prefill_fused_kernels if is_prefill else self.decode_fused_kernels
@@ -317,9 +304,17 @@ class MiniCPMSparseBackend(AttentionBackend):
             kwargs = dict(self.fused_kernel_kwargs, batch_size=batch_size)
             if is_prefill:
                 kwargs["max_seqlen_q_grid"] = self.prefill_kernel_max_seqlen_q_grid
-                cache[batch_size] = fused_attn_pooling_online_topk_prefill(**kwargs)
+                cache[batch_size] = build_fused_topk_kernels(
+                    is_causal=True, k_splits=1, **kwargs
+                )
             else:
-                cache[batch_size] = fused_attn_pooling_online_topk_decode(**kwargs)
+                cache[batch_size] = build_fused_topk_kernels(
+                    is_causal=False,
+                    k_splits=decode_k_splits(
+                        self.max_context_len // self.kernel_stride
+                    ),
+                    **kwargs,
+                )
         return cache[batch_size]
 
     def update_batch_for_sparse(
@@ -604,7 +599,6 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_k,
                 self.block_size,
                 self.sparse_topk,
-                self.kernel_topk,
                 cu_seqlens_q,
                 compressed_cu_seqlens,
                 cache_lens=cache_lens,
