@@ -33,6 +33,8 @@ def make_runner_scaffold(
     max_context_len=1024,
     max_running_requests=1,
     num_kv_heads=1,
+    device="cpu",
+    window_size=64,
 ):
     """Build the (model_runner, flash_attn_backend) SimpleNamespace pair
     that MiniCPMSparseBackend construction reads;
@@ -43,16 +45,19 @@ def make_runner_scaffold(
     # tables the way cache.py does.
     req_pool = SimpleNamespace(
         req_to_sparse_k1_token=_sparse_token_table(
-            pages=(max_context_len - kernel_size) // kernel_stride + 1, device="cpu"
+            pages=(max_context_len - kernel_size) // kernel_stride + 1, device=device
         ),
         req_to_sparse_k2_token=_sparse_token_table(
             pages=(max_context_len - kernel_size * 4) // (kernel_stride * 4) + 1,
-            device="cpu",
+            device=device,
+        ),
+        req_to_token=torch.arange(8 * 1024, dtype=torch.int32, device=device).view(
+            8, 1024
         ),
     )
     flash_attn_backend = SimpleNamespace(
         max_context_len=max_context_len,
-        device="cpu",
+        device=device,
         decode_cuda_graph_metadata={},
         req_to_token_pool=req_pool,
         token_to_kv_pool=SimpleNamespace(),
@@ -72,7 +77,7 @@ def make_runner_scaffold(
                     "kernel_stride": kernel_stride,
                     "init_blocks": 1,
                     "block_size": 64,
-                    "window_size": 64,
+                    "window_size": window_size,
                     "dense_len": 128,
                     "topk": 1,
                 },
@@ -100,13 +105,22 @@ def make_sparse_backend(
     kv_cache_dtype_str="bfloat16",
     server_args_overrides=None,
     num_kv_heads=1,
+    device="cpu",
+    window_size=None,
 ):
     """A CPU MiniCPMSparseBackend over the mocked runner scaffold; returns
     (backend, model_runner, flash_attn_backend, flash_attention_ctor)."""
+    if window_size is None:
+        # Tree verify requires the local window to cover the draft tokens plus
+        # one block; every other shape keeps the scaffold's one-block window.
+        tree = ((server_args_overrides or {}).get("speculative_eagle_topk") or 1) > 1
+        window_size = 128 if tree else 64
     model_runner, flash_attn_backend = make_runner_scaffold(
         max_context_len=max_context_len,
         max_running_requests=max_running_requests,
         num_kv_heads=num_kv_heads,
+        device=device,
+        window_size=window_size,
     )
     flash_attn_backend.kv_cache_dtype_str = kv_cache_dtype_str
     flash_attn_backend.init_forward_metadata = Mock()
@@ -141,7 +155,9 @@ def make_sparse_backend(
     return backend, model_runner, flash_attn_backend, flash_attention
 
 
-def make_spec_backend(*, num_draft_tokens, eagle_topk, num_kv_heads=1):
+def make_spec_backend(
+    *, num_draft_tokens, eagle_topk, num_kv_heads=1, device="cpu", window_size=None
+):
     """Build a MiniCPMSparseBackend configured for one draft shape,
     with a mocked adapter. Returns (backend, flash_attn_backend)."""
     backend, _, flash_attn_backend, _ = make_sparse_backend(
@@ -150,42 +166,46 @@ def make_spec_backend(*, num_draft_tokens, eagle_topk, num_kv_heads=1):
             "speculative_eagle_topk": eagle_topk,
         },
         num_kv_heads=num_kv_heads,
+        device=device,
+        window_size=window_size,
     )
     backend.attention_adapter = Mock()
     return backend, flash_attn_backend
 
 
-def _verify_round_layout(*, seq_lens, num_draft_tokens):
+def _verify_round_layout(*, seq_lens, num_draft_tokens, device):
     """The seq/cu_seqlens layout shared by the eager and replay builders."""
     bs = len(seq_lens)
     seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
-    cache_seqlens = seq_lens_cpu + num_draft_tokens
+    cache_seqlens = (seq_lens_cpu + num_draft_tokens).to(device)
     cu_seqlens_q = torch.arange(
-        0, bs * num_draft_tokens + 1, num_draft_tokens, dtype=torch.int32
+        0, bs * num_draft_tokens + 1, num_draft_tokens, dtype=torch.int32, device=device
     )
     cu_seqlens_k = F.pad(torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0))
     return cache_seqlens, cu_seqlens_q, cu_seqlens_k
 
 
-def make_verify_batch(seq_lens, num_draft_tokens):
+def make_verify_batch(seq_lens, num_draft_tokens, *, device="cpu"):
     """Build one verify round's eager inputs: (forward_batch, base)."""
     bs = len(seq_lens)
     seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
     cache_seqlens, cu_seqlens_q, cu_seqlens_k = _verify_round_layout(
-        seq_lens=seq_lens, num_draft_tokens=num_draft_tokens
+        seq_lens=seq_lens, num_draft_tokens=num_draft_tokens, device=device
     )
     forward_batch = SimpleNamespace(
         batch_size=bs,
-        seq_lens=seq_lens_cpu.clone(),
+        seq_lens=seq_lens_cpu.clone().to(device),
         seq_lens_cpu=seq_lens_cpu,
-        req_pool_indices=torch.arange(bs, dtype=torch.int64),
+        req_pool_indices=torch.arange(bs, dtype=torch.int64, device=device),
     )
     base = SimpleNamespace(
         cache_seqlens_int32=cache_seqlens,
         max_seq_len_k=int(cache_seqlens.max()),
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
-        page_table=torch.zeros((bs, int(cache_seqlens.max())), dtype=torch.int32),
+        page_table=torch.zeros(
+            (bs, int(cache_seqlens.max())), dtype=torch.int32, device=device
+        ),
     )
     return forward_batch, base
 
@@ -199,9 +219,11 @@ def plan_verify(
     dense_len,
     sparse_topk,
     block_size,
+    num_draft_visible=None,
+    device="cpu",
 ):
     """Plan one eager verify round; returns (forward_batch, base, metadata)."""
-    forward_batch, base = make_verify_batch(seq_lens, num_draft_tokens)
+    forward_batch, base = make_verify_batch(seq_lens, num_draft_tokens, device=device)
     metadata = MiniCPMSparseMetadata(base=base)
     _plan_sparse_verify(
         forward_batch=forward_batch,
@@ -212,6 +234,7 @@ def plan_verify(
         sparse_topk=sparse_topk,
         block_size=block_size,
         num_draft_tokens=num_draft_tokens,
+        num_draft_visible=num_draft_visible,
     )
     return forward_batch, base, metadata
 
@@ -223,17 +246,19 @@ def make_replay_backend(
     eagle_topk=1,
     num_kv_heads=1,
     max_bs,
+    device="cpu",
 ):
     """Size a backend's CUDA-graph buffers for max_bs verify requests;
     return (backend, base) with the static base buffers the replay leaves."""
     bs = len(seq_lens)
     cache_seqlens, cu_seqlens_q, cu_seqlens_k = _verify_round_layout(
-        seq_lens=seq_lens, num_draft_tokens=num_draft_tokens
+        seq_lens=seq_lens, num_draft_tokens=num_draft_tokens, device=device
     )
     backend, _ = make_spec_backend(
         num_draft_tokens=num_draft_tokens,
         eagle_topk=eagle_topk,
         num_kv_heads=num_kv_heads,
+        device=device,
     )
     backend.init_cuda_graph_state(max_bs, max_bs * num_draft_tokens)
     base = SimpleNamespace(
@@ -243,6 +268,48 @@ def make_replay_backend(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         # The graph page table spans the context; page_size is 1 in the scaffold.
-        page_table=torch.zeros((bs, backend.max_context_len), dtype=torch.int32),
+        page_table=torch.zeros(
+            (bs, backend.max_context_len), dtype=torch.int32, device=device
+        ),
     )
     return backend, base
+
+
+def tree_mask_from_parents(parents):
+    """Ancestor-closure visibility square of one request's draft tree."""
+    num_draft_tokens = len(parents)
+    mask = torch.zeros((num_draft_tokens, num_draft_tokens), dtype=torch.bool)
+    for token in range(num_draft_tokens):
+        node = token
+        while node != -1:
+            mask[token, node] = True
+            node = parents[node]
+    return mask
+
+
+def visible_counts(*, mask, bs, num_draft_tokens):
+    """Causal-prefix popcount oracle of a staged visibility square."""
+    causal = torch.tril(
+        torch.ones(
+            (num_draft_tokens, num_draft_tokens), dtype=torch.bool, device=mask.device
+        )
+    )
+    return (
+        (mask.view(bs, num_draft_tokens, num_draft_tokens) & causal)
+        .sum(dim=-1, dtype=torch.int32)
+        .view(-1)
+    )
+
+
+def pack_custom_mask(seq_lens, squares, device="cpu"):
+    """Pack rows in EAGLE's custom_mask layout: prefix columns all-visible,
+    trailing square from the tree."""
+    rows = []
+    for seq_len, square in zip(seq_lens, squares):
+        num_draft_tokens = square.shape[0]
+        request = torch.ones(
+            (num_draft_tokens, seq_len + num_draft_tokens), dtype=torch.bool
+        )
+        request[:, seq_len:] = square
+        rows.append(request.view(-1))
+    return torch.cat(rows).to(device)
