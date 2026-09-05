@@ -435,6 +435,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             extend_seq_lens_cpu=[1],
             extend_prefix_lens_cpu=[0],
             forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
                 is_extend_or_draft_extend_or_mixed=lambda: True,
             ),
         )
@@ -586,6 +587,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             extend_prefix_lens_cpu=[49, 199],
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
                 is_extend_or_draft_extend_or_mixed=lambda: True,
             ),
         )
@@ -675,6 +677,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             out_cache_loc=torch.tensor([0, 1], dtype=torch.int64),
             forward_mode=SimpleNamespace(
                 is_draft_extend_v2=lambda: False,
+                is_target_verify=lambda: False,
             ),
         )
 
@@ -851,6 +854,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         forward_batch = SimpleNamespace(
             batch_size=2,
             out_cache_loc=torch.tensor([1, 2], dtype=torch.int64),
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
         )
 
         with patch.object(
