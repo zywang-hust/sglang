@@ -130,6 +130,7 @@ def test_decode_topk_deterministic_multi_round():
             k,
             cu_seqlens_q,
             cu_seqlens_k,
+            cu_seqlens_k[:-1],
             cache_lens,
             stats,
         )
@@ -138,6 +139,7 @@ def test_decode_topk_deterministic_multi_round():
             k,
             cu_seqlens_q,
             cu_seqlens_k,
+            cu_seqlens_k[:-1],
             cache_lens,
             stats,
             pool_scores,
@@ -300,7 +302,7 @@ def test_prefill_grid_padding_preserves_unassigned_rows():
     cache = torch.full((2,), 64, device="cuda", dtype=torch.int32)
     stats = torch.ones((_HEAD_KV, 8, _GROUPS, 1, 2), device="cuda")
     scores = torch.full((_HEAD_KV, 8, kernels.pooled_k_len), 123.0, device="cuda")
-    kernels.scores(q, k, cu_q, cu_k, cache, stats, scores)
+    kernels.scores(q, k, cu_q, cu_k, cu_k[:-1], cache, stats, scores)
     assert scores[:, 3:].eq(123.0).all()
 
 
@@ -338,12 +340,12 @@ def _small_score_kernels(*, q_lens, causal, splits):
     )
 
 
-def _score_outputs(kernels, q, k, cu_q, cu_k, cache):
+def _score_outputs(kernels, q, k, cu_q, cu_k, starts, cache):
     rows = q.shape[0] // _GROUPS
     stats = torch.empty((_HEAD_KV, rows, _GROUPS, kernels.k_splits, 2), device="cuda")
     scores = torch.empty((_HEAD_KV, rows, kernels.pooled_k_len), device="cuda")
-    kernels.stats(q, k, cu_q, cu_k, cache, stats)
-    kernels.scores(q, k, cu_q, cu_k, cache, stats, scores)
+    kernels.stats(q, k, cu_q, cu_k, starts, cache, stats)
+    kernels.scores(q, k, cu_q, cu_k, starts, cache, stats, scores)
     return stats, scores
 
 
@@ -399,7 +401,7 @@ def test_pooled_scores_match_headwise_softmax(causal, q_len, k_len, cache, split
     cu_q = torch.tensor([0, q_len], dtype=torch.int32, device="cuda")
     cu_k = torch.tensor([0, k_len], dtype=torch.int32, device="cuda")
     cache_lens = torch.tensor([cache], dtype=torch.int32, device="cuda")
-    stats, scores = _score_outputs(kernels, q, k, cu_q, cu_k, cache_lens)
+    stats, scores = _score_outputs(kernels, q, k, cu_q, cu_k, cu_k[:-1], cache_lens)
     logits, expected = _reference_pooled_scores(
         q, k, cache=cache, causal=causal, num_blocks=96
     )
@@ -412,6 +414,66 @@ def test_pooled_scores_match_headwise_softmax(causal, q_len, k_len, cache, split
     torch.testing.assert_close(maximum, expected_maximum, atol=3e-5, rtol=3e-5)
     torch.testing.assert_close(denominator, expected_denominator, atol=3e-5, rtol=3e-5)
     torch.testing.assert_close(scores.cpu(), expected, atol=3e-5, rtol=3e-5)
+
+
+def test_direct_segments_match_packed_keys_on_graph_replay():
+    """Repeated rows must read updated source segments after graph replay."""
+    generator = torch.Generator().manual_seed(29)
+    q = (
+        (torch.randn(3 * _GROUPS, _HEAD_KV, _DIM, generator=generator) * 0.25)
+        .bfloat16()
+        .cuda()
+    )
+    source = (
+        (torch.randn(800, _HEAD_KV, _DIM, generator=generator) * 0.25).bfloat16().cuda()
+    )
+    kernels = _small_score_kernels(q_lens=[1, 1, 1], causal=False, splits=4)
+    cu_q = torch.arange(4, dtype=torch.int32, device="cuda")
+    cu_k = torch.empty(4, dtype=torch.int32, device="cuda")
+    starts = torch.empty(3, dtype=torch.int32, device="cuda")
+    cache = torch.empty(3, dtype=torch.int32, device="cuda")
+
+    def set_layout(offsets, lengths):
+        starts.copy_(torch.tensor(offsets, dtype=torch.int32))
+        cu_k.copy_(
+            torch.tensor(
+                [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32
+            )
+        )
+        cache.copy_(
+            torch.tensor(
+                [(length + 1) * _KERNEL_STRIDE - 1 for length in lengths],
+                dtype=torch.int32,
+            )
+        )
+
+    set_layout([0, 0, 300], [257, 257, 129])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _, warmup_scores = _score_outputs(kernels, q, source, cu_q, cu_k, starts, cache)
+        select_topk_blocks(warmup_scores, topk=8)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _, direct_scores = _score_outputs(kernels, q, source, cu_q, cu_k, starts, cache)
+        direct_indices = select_topk_blocks(direct_scores, topk=8)
+
+    for offsets, lengths in (
+        ([0, 0, 300], [257, 257, 129]),
+        ([300, 300, 0], [129, 129, 257]),
+    ):
+        set_layout(offsets, lengths)
+        source.mul_(-1)
+        graph.replay()
+        packed = torch.cat(
+            [source[start : start + length] for start, length in zip(offsets, lengths)]
+        )
+        _, packed_scores = _score_outputs(
+            kernels, q, packed, cu_q, cu_k, cu_k[:-1], cache
+        )
+        torch.testing.assert_close(direct_scores, packed_scores, atol=0, rtol=0)
+        assert torch.equal(direct_indices, select_topk_blocks(packed_scores, topk=8))
 
 
 if __name__ == "__main__":

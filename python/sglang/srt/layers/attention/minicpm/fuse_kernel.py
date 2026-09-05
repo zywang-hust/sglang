@@ -33,11 +33,11 @@ def decode_k_splits(max_k_len: int) -> int:
     return max(1, -(-k_tiles // _DECODE_TILES_PER_SPLIT))
 
 
-def _row_geometry(cu_seqlens_q, cu_seqlens_k, cache_lens, batch_idx):
+def _row_geometry(cu_seqlens_q, cu_seqlens_k, k_starts, cache_lens, batch_idx):
     return (
         cu_seqlens_q[batch_idx],
         cu_seqlens_q[batch_idx + 1],
-        cu_seqlens_k[batch_idx],
+        k_starts[batch_idx],
         cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx],
         cache_lens[batch_idx],
     )
@@ -137,6 +137,7 @@ def _fused_attn_stats(
         K_unpad: T.Tensor(kv_shape, dtype),
         cu_seqlens_q: T.Tensor([batch_size + 1], "int32"),
         cu_seqlens_k: T.Tensor([batch_size + 1], "int32"),
+        k_starts: T.Tensor([batch_size], "int32"),
         cache_lens: T.Tensor([batch_size], "int32"),
         Stats: T.Tensor(stats_shape, "float32"),
     ):
@@ -158,7 +159,7 @@ def _fused_attn_stats(
             original_q_idx = bx
 
             q_start_idx, q_end_idx, k_start_idx, k_len, cache_len = _row_geometry(
-                cu_seqlens_q, cu_seqlens_k, cache_lens, batch_idx
+                cu_seqlens_q, cu_seqlens_k, k_starts, cache_lens, batch_idx
             )
             k_end_idx = k_start_idx + k_len
             q_current_seqlen = T.alloc_var("int32", init=q_end_idx - q_start_idx)
@@ -281,6 +282,7 @@ def _fused_attn_pooled_scores(
         K_unpad: T.Tensor(kv_shape, dtype),
         cu_seqlens_q: T.Tensor([batch_size + 1], "int32"),
         cu_seqlens_k: T.Tensor([batch_size + 1], "int32"),
+        k_starts: T.Tensor([batch_size], "int32"),
         cache_lens: T.Tensor([batch_size], "int32"),
         Stats: T.Tensor(stats_shape, "float32"),
         PoolScores: T.Tensor(scores_shape, "float32"),
@@ -302,7 +304,7 @@ def _fused_attn_pooled_scores(
             original_q_idx = bx
 
             q_start_idx, q_end_idx, k_start_idx, k_len, cache_len = _row_geometry(
-                cu_seqlens_q, cu_seqlens_k, cache_lens, batch_idx
+                cu_seqlens_q, cu_seqlens_k, k_starts, cache_lens, batch_idx
             )
             k_end_idx = k_start_idx + k_len
             q_current_seqlen = T.alloc_var("int32", init=q_end_idx - q_start_idx)

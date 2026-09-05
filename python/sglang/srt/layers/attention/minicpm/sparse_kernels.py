@@ -691,55 +691,71 @@ def fill_compress_level_metadata(
 def _repeated_segments_kernel(
     cu_seqlens_ptr,  # int32 [bs+1] packed chunk counts per request
     segment_starts_ptr,  # int32 [bs+1] where each request's chunks sit in the source
-    index_ptr,  # int64 out: packed gather index, one row per (request, repeat)
+    starts_out_ptr,  # int32 [bs*repeats] out: each row's segment start
     cu_seqlens_out_ptr,  # int32 [bs*repeats+1] out: packed row bounds into [1:]
     repeats,
-    segment_rows,
-    BLOCK: tl.constexpr,
 ):
     # Device mirror of _plan_repeated_segments for captured verify replay.
     row = tl.program_id(0)
-    num_rows = tl.num_programs(0)
     batch_idx = row // repeats
     packed_start = tl.load(cu_seqlens_ptr + batch_idx)
     length = tl.load(cu_seqlens_ptr + batch_idx + 1) - packed_start
-    row_start = repeats * packed_start + (row % repeats) * length
-    tl.store(cu_seqlens_out_ptr + 1 + row, row_start + length)
-    segment_start = tl.load(segment_starts_ptr + batch_idx).to(tl.int64)
-    for chunk in range(0, tl.cdiv(length, BLOCK)):
-        offs = chunk * BLOCK + tl.arange(0, BLOCK)
-        tl.store(index_ptr + row_start + offs, segment_start + offs, mask=offs < length)
-    # The captured gather reads the whole view, so the tail past the packed rows
-    # must stay inside the smallest compression view: each row zeroes one share.
-    packed_end = repeats * tl.load(cu_seqlens_ptr + num_rows // repeats)
-    end = num_rows * segment_rows
-    zero = tl.zeros([BLOCK], dtype=tl.int64)
-    for chunk in range(0, tl.cdiv(segment_rows, BLOCK)):
-        offs = packed_end + row * segment_rows + chunk * BLOCK + tl.arange(0, BLOCK)
-        tl.store(index_ptr + offs, zero, mask=offs < end)
+    tl.store(
+        cu_seqlens_out_ptr + 1 + row,
+        repeats * packed_start + (row % repeats + 1) * length,
+    )
+    tl.store(starts_out_ptr + row, tl.load(segment_starts_ptr + batch_idx))
 
 
 def fill_repeated_segments(
     cu_seqlens: torch.Tensor,
     *,
     segment_starts: torch.Tensor,
-    index_out: torch.Tensor,
+    starts_out: torch.Tensor,
     cu_seqlens_out: torch.Tensor,
     repeats: int,
-    segment_rows: int,
 ) -> None:
-    """Fill the packed per-row repeat layout of a compression level whose chunks
-    sit at ``segment_starts`` in the source buffer, zeroing the index tail past
-    the packed rows; ``cu_seqlens_out[0]`` must be pre-zeroed."""
+    """Fill the per-row repeat layout of a compression level whose chunks sit
+    at ``segment_starts`` in the source buffer; ``cu_seqlens_out[0]`` must be
+    pre-zeroed."""
     bs = cu_seqlens.numel() - 1
     _repeated_segments_kernel[(bs * repeats,)](
-        cu_seqlens,
-        segment_starts,
-        index_out,
-        cu_seqlens_out,
-        repeats=repeats,
-        segment_rows=segment_rows,
-        BLOCK=min(triton.next_power_of_2(segment_rows), 1024),
+        cu_seqlens, segment_starts, starts_out, cu_seqlens_out, repeats=repeats
+    )
+
+
+@triton.jit
+def _copy_repeated_segments_kernel(
+    src_ptr,
+    starts_ptr,  # int32 [rows] source row of each row's segment
+    cu_seqlens_ptr,  # int32 [rows+1] packed destination bounds
+    out_ptr,
+    row_numel,  # elements per source row
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    out_start = tl.load(cu_seqlens_ptr + row).to(tl.int64)
+    length = tl.load(cu_seqlens_ptr + row + 1) - out_start
+    src_start = tl.load(starts_ptr + row).to(tl.int64)
+    numel = length * row_numel
+    for chunk in range(0, tl.cdiv(numel, BLOCK)):
+        offs = chunk * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < numel
+        values = tl.load(src_ptr + src_start * row_numel + offs, mask=mask)
+        tl.store(out_ptr + out_start * row_numel + offs, values, mask=mask)
+
+
+def copy_repeated_segments(
+    src: torch.Tensor,
+    *,
+    starts: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Copy each row's segment of ``src`` into ``out`` packed at ``cu_seqlens``,
+    for readers that take contiguous rows instead of per-row starts."""
+    _copy_repeated_segments_kernel[(starts.numel(),)](
+        src, starts, cu_seqlens, out, row_numel=src[0].numel(), BLOCK=1024
     )
 
 

@@ -322,11 +322,15 @@ def compressed_attention_tilelang(
     cache_lens=None,
     fused_kernel: Optional[FusedTopkKernels] = None,
     max_cache_len=-1,
+    k_starts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute top-k block indices with the tilelang fused kernels (the fused
-    path scores on the k1 level alone)."""
+    path scores on the k1 level alone). ``k_starts`` places each row's keys
+    in ``k``; by default rows are packed at ``cu_seqlens_k``."""
     with torch.no_grad():
         batch_size = cu_seqlens_q.shape[0] - 1
+        if k_starts is None:
+            k_starts = cu_seqlens_k[:-1]
 
         total_q_len = q.shape[0]
         num_kv_heads = k.shape[1]
@@ -372,6 +376,7 @@ def compressed_attention_tilelang(
             k_kernel,
             cu_seqlens_q,
             cu_seqlens_k,
+            k_starts,
             cache_lens_tensor,
             stats,
         )
@@ -380,6 +385,7 @@ def compressed_attention_tilelang(
             k_kernel,
             cu_seqlens_q,
             cu_seqlens_k,
+            k_starts,
             cache_lens_tensor,
             stats,
             pool_scores,
@@ -416,11 +422,11 @@ class CompressionLevelMetadata(msgspec.Struct):
 
 
 class RepeatedSegmentLayout(msgspec.Struct):
-    """Per-row gather of each request's compressed segment:
-    ``index`` gathers the repeated segments from a flat compressed cache;
-    ``cu_seqlens`` bounds them per row."""
+    """One row per (request, repeat) over a request's compressed segment:
+    ``starts`` places each row's segment in the source buffer and
+    ``cu_seqlens`` bounds the rows as if they were packed."""
 
-    index: torch.Tensor
+    starts: torch.Tensor
     cu_seqlens: torch.Tensor
 
 
@@ -814,28 +820,18 @@ def _plan_sparse_prefill(
 def _plan_repeated_segments(
     cu_seqlens: torch.Tensor,
     *,
-    total_tokens: int,
     repeats: int,
     segment_starts: Optional[torch.Tensor] = None,
 ) -> RepeatedSegmentLayout:
     lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).repeat_interleave(repeats)
     out_cu_seqlens = F.pad(torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0))
     # segment_starts locates each request's chunks in the source buffer
-    # when it is not packed (the CUDA graph slab); the output stays packed.
+    # when it is not packed (the CUDA graph slab).
     if segment_starts is None:
         segment_starts = cu_seqlens[:-1]
-    # index[i] = segment_start + (i - output_row_start),
-    # so each output row adds (segment_start - output_row_start) to a flat arange.
-    row_delta = (segment_starts.repeat_interleave(repeats) - out_cu_seqlens[:-1]).to(
-        torch.int64
+    return RepeatedSegmentLayout(
+        starts=segment_starts.repeat_interleave(repeats), cu_seqlens=out_cu_seqlens
     )
-    # total_tokens as output_size keeps repeat_interleave sync-free.
-    index = row_delta.repeat_interleave(
-        lengths.to(torch.int64), output_size=repeats * total_tokens
-    ) + torch.arange(
-        repeats * total_tokens, dtype=torch.int64, device=cu_seqlens.device
-    )
-    return RepeatedSegmentLayout(index=index, cu_seqlens=out_cu_seqlens)
 
 
 def _build_tree_verify_base_geometry(

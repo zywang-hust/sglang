@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.minicpm.cache import attach_compressed_cache
 from sglang.srt.layers.attention.minicpm.sparse_kernels import (
     compact_sparse_tree_page_table,
     copy_eagle_draft_tree_mask,
+    copy_repeated_segments,
     fill_compress_level_metadata,
     fill_dense_page_table_rows,
     fill_repeated_segments,
@@ -481,17 +482,13 @@ class MiniCPMSparseBackend(AttentionBackend):
             num_draft_tokens=num_draft_tokens,
             num_draft_visible=num_draft_visible,
         )
-        # Varlen segments cannot be shared across verify rows.
+        # Each verify row needs its own logical length and source segment start.
         metadata.k1_repeat = _plan_repeated_segments(
-            metadata.k1.cu_seqlens,
-            total_tokens=metadata.k1.cu_seqlens_cpu[-1],
-            repeats=num_draft_tokens,
+            metadata.k1.cu_seqlens, repeats=num_draft_tokens
         )
         if "k2" in self.verify_repeat_levels:
             metadata.k2_repeat = _plan_repeated_segments(
-                metadata.k2.cu_seqlens,
-                total_tokens=metadata.k2.cu_seqlens_cpu[-1],
-                repeats=num_draft_tokens,
+                metadata.k2.cu_seqlens, repeats=num_draft_tokens
             )
 
     def _stage_tree_verify_drafts(
@@ -671,12 +668,18 @@ class MiniCPMSparseBackend(AttentionBackend):
             )
             compressed_cu_seqlens = metadata.k1.cu_seqlens
             compressed_cu_seqlens2 = metadata.k2.cu_seqlens
+            compressed_k_starts = None
             if metadata.k1_repeat is not None:
-                compressed_k = compressed_k.index_select(0, metadata.k1_repeat.index)
                 compressed_cu_seqlens = metadata.k1_repeat.cu_seqlens
-                if metadata.k2_repeat is not None:
-                    compressed_k2 = compressed_k2.index_select(
-                        0, metadata.k2_repeat.index
+                if self.minicpm_fuse_topk:
+                    # The fused kernel reads each verify row's segment in place.
+                    compressed_k_starts = metadata.k1_repeat.starts
+                else:
+                    compressed_k = self._copy_repeated_segments(
+                        "k1", compressed_k, metadata.k1_repeat, metadata.k1
+                    )
+                    compressed_k2 = self._copy_repeated_segments(
+                        "k2", compressed_k2, metadata.k2_repeat, metadata.k2
                     )
                     compressed_cu_seqlens2 = metadata.k2_repeat.cu_seqlens
 
@@ -690,6 +693,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens=compressed_cu_seqlens,
                 compressed_k2=compressed_k2,
                 compressed_cu_seqlens2=compressed_cu_seqlens2,
+                compressed_k_starts=compressed_k_starts,
                 fused_kernel=self._get_fused_topk_kernel(
                     metadata.topk_cu_seqlens_q.shape[0] - 1,
                     is_prefill=False,
@@ -709,6 +713,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         compressed_cu_seqlens=None,
         compressed_k2=None,
         compressed_cu_seqlens2=None,
+        compressed_k_starts=None,
         fused_kernel=None,
     ):
         cache_lens = None
@@ -762,6 +767,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 cache_lens=cache_lens,
                 fused_kernel=fused_kernel,
                 max_cache_len=self.max_context_len,
+                k_starts=compressed_k_starts,
             )
 
         return topk_idx
@@ -1315,20 +1321,28 @@ class MiniCPMSparseBackend(AttentionBackend):
             if self.speculative_num_draft_tokens is not None and (
                 name in self.verify_repeat_levels
             ):
-                # The captured gather records this index's address; it must
-                # outlive the graphs, and every round rewrites its packed layout.
+                # The captured top-k records these addresses; they must outlive
+                # the graphs, and every round rewrites the layout.
                 max_verify_tokens = max_bs * self.speculative_num_draft_tokens
                 buffers[f"{name}_repeat"] = RepeatedSegmentLayout(
-                    index=torch.zeros(
-                        max_verify_tokens
-                        * (self.max_context_len // level.kernel_stride),
-                        dtype=torch.int64,
-                        device=self.device,
+                    starts=torch.zeros(
+                        max_verify_tokens, dtype=torch.int32, device=self.device
                     ),
                     cu_seqlens=torch.zeros(
                         max_verify_tokens + 1, dtype=torch.int32, device=self.device
                     ),
                 )
+                if not self.minicpm_fuse_topk:
+                    buffers[f"compress_{name}_repeat"] = torch.zeros(
+                        (
+                            buffers[f"compress_{name}"].shape[0]
+                            * self.speculative_num_draft_tokens,
+                            self.head_group_num,
+                            self.head_dim,
+                        ),
+                        dtype=self.model_dtype,
+                        device=self.device,
+                    )
             for field in (
                 "cu_seqlens",
                 "cu_new_token_nums",
@@ -1630,16 +1644,12 @@ class MiniCPMSparseBackend(AttentionBackend):
                 level.token_table, 0, forward_batch.req_pool_indices, out=dst.table
             )
             if level.name in self.verify_repeat_levels:
-                segment_rows = self.max_context_len // kernel_stride
                 self._write_verify_repeat_layout(
                     dst,
                     self._verify_repeat_layout_views(
                         level.name,
-                        bs=bs,
                         num_verify_tokens=bs * self.speculative_num_draft_tokens,
-                        segment_rows=segment_rows,
                     ),
-                    segment_rows=segment_rows,
                 )
 
     def _bind_sparse_verify_graph_metadata(
@@ -1783,29 +1793,23 @@ class MiniCPMSparseBackend(AttentionBackend):
         # _compress_decode_keys sizes the compression view from cu_seqlens_cpu,
         # so seed it to the slab extent the compression kernel writes into.
         level_metadata.cu_seqlens_cpu = [row * segment_rows for row in range(bs + 1)]
-        # Mirror the eager planner: under minicpm_fuse_topk the k2 repeat is unset,
-        # and the captured gather records the plain level cu_seqlens.
+        # Mirror the eager planner: under minicpm_fuse_topk the k2 repeat is unset.
         if level.name not in self.verify_repeat_levels:
             return None
         repeat = self._verify_repeat_layout_views(
-            level.name,
-            bs=bs,
-            num_verify_tokens=num_verify_tokens,
-            segment_rows=segment_rows,
+            level.name, num_verify_tokens=num_verify_tokens
         )
-        self._write_verify_repeat_layout(
-            level_metadata, repeat, segment_rows=segment_rows
-        )
+        self._write_verify_repeat_layout(level_metadata, repeat)
         return repeat
 
     def _verify_repeat_layout_views(
-        self, name: str, *, bs: int, num_verify_tokens: int, segment_rows: int
+        self, name: str, *, num_verify_tokens: int
     ) -> RepeatedSegmentLayout:
-        # The captured gather recorded the retained buffers' addresses,
+        # The captured top-k recorded the retained buffers' addresses,
         # so capture and replay both work through prefix views of them.
         retained = self.decode_cuda_graph_metadata[f"{name}_repeat"]
         return RepeatedSegmentLayout(
-            index=retained.index[: num_verify_tokens * segment_rows],
+            starts=retained.starts[:num_verify_tokens],
             cu_seqlens=retained.cu_seqlens[: num_verify_tokens + 1],
         )
 
@@ -1813,19 +1817,43 @@ class MiniCPMSparseBackend(AttentionBackend):
         self,
         level_metadata: CompressionLevelMetadata,
         repeat: RepeatedSegmentLayout,
-        *,
-        segment_rows: int,
     ) -> None:
         # The compression kernel writes request b's chunks at slab offset
-        # cu_total[b], so the packed rows gather from there.
+        # cu_total[b], so every row of request b starts there.
         fill_repeated_segments(
             cu_seqlens=level_metadata.cu_seqlens,
             segment_starts=level_metadata.cu_total_compress_token_nums,
-            index_out=repeat.index,
+            starts_out=repeat.starts,
             cu_seqlens_out=repeat.cu_seqlens,
             repeats=self.speculative_num_draft_tokens,
-            segment_rows=segment_rows,
         )
+
+    def _copy_repeated_segments(
+        self,
+        name: str,
+        compressed_k: torch.Tensor,
+        repeat: RepeatedSegmentLayout,
+        level_metadata: CompressionLevelMetadata,
+    ) -> torch.Tensor:
+        # compressed_attention takes packed rows, so the non-fused path
+        # materializes each verify row's segment.
+        total_rows = (
+            level_metadata.cu_seqlens_cpu[-1] * self.speculative_num_draft_tokens
+        )
+        if self._use_cuda_graph_buffers:
+            out = self.decode_cuda_graph_metadata[f"compress_{name}_repeat"][
+                :total_rows
+            ]
+        else:
+            out = torch.empty(
+                (total_rows, *compressed_k.shape[1:]),
+                dtype=compressed_k.dtype,
+                device=self.device,
+            )
+        copy_repeated_segments(
+            compressed_k, starts=repeat.starts, cu_seqlens=repeat.cu_seqlens, out=out
+        )
+        return out
 
     def _write_verify_graph_rows(
         self,

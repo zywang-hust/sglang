@@ -24,6 +24,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
 from sglang.srt.layers.attention.minicpm.sparse_kernels import (
+    copy_repeated_segments,
     fill_compress_level_metadata,
     fill_repeated_segments,
 )
@@ -181,18 +182,13 @@ class TestVerifyGraphReplay(CustomTestCase):
     def _assert_repeat_layouts_match_eager(
         self, backend, metadata, eager_levels, real_bs, num_draft_tokens
     ):
-        """The retained repeat layouts gather, from the slab-laid compression
-        buffers, the chunk rows the eager planner gathers from packed ones;
-        the row bounds are equal and the padded tokens have empty rows."""
         num_real_tokens = real_bs * num_draft_tokens
         for name, eager_level in zip(("k1", "k2"), eager_levels):
             if name not in backend.verify_repeat_levels:
                 continue
             level = getattr(metadata, name)
             eager_layout = _plan_repeated_segments(
-                eager_level.cu_seqlens,
-                total_tokens=eager_level.cu_seqlens_cpu[-1],
-                repeats=num_draft_tokens,
+                eager_level.cu_seqlens, repeats=num_draft_tokens
             )
             retained = backend.decode_cuda_graph_metadata[f"{name}_repeat"]
             padded_tokens = level.cu_seqlens.numel() - 1
@@ -208,22 +204,11 @@ class TestVerifyGraphReplay(CustomTestCase):
                 ).all(),
                 name,
             )
-            # Lay the packed chunk rows out at the slab offsets the compression
-            # kernel writes to, then gather both ways.
-            packed_cu = eager_level.cu_seqlens
-            device = retained.index.device
-            packed = torch.arange(
-                int(packed_cu[-1]), dtype=torch.float32, device=device
+            want_starts = level.cu_total_compress_token_nums[:real_bs]
+            want_starts = want_starts.repeat_interleave(num_draft_tokens)
+            self.assertTrue(
+                torch.equal(retained.starts[:num_real_tokens], want_starts), name
             )
-            slab = torch.full(
-                (int(level.cu_total_compress_token_nums[-1]),), -1.0, device=device
-            )
-            for batch_idx in range(real_bs):
-                start = int(level.cu_total_compress_token_nums[batch_idx])
-                rows = packed[packed_cu[batch_idx] : packed_cu[batch_idx + 1]]
-                slab[start : start + rows.numel()] = rows
-            gathered = slab[retained.index[: eager_layout.index.numel()]]
-            self.assertTrue(torch.equal(gathered, packed[eager_layout.index]), name)
 
     def _assert_capture_frozen_aranges_intact(
         self, backend, metadata, bs, num_draft_tokens
@@ -372,7 +357,7 @@ class TestVerifyGraphReplay(CustomTestCase):
         for name in ("k1", "k2"):
             layout = getattr(metadata, f"{name}_repeat")
             retained = backend.decode_cuda_graph_metadata[f"{name}_repeat"]
-            self.assertEqual(layout.index.data_ptr(), retained.index.data_ptr())
+            self.assertEqual(layout.starts.data_ptr(), retained.starts.data_ptr())
             self.assertEqual(
                 layout.cu_seqlens.data_ptr(), retained.cu_seqlens.data_ptr()
             )
@@ -402,32 +387,30 @@ class TestVerifyGraphReplay(CustomTestCase):
             )
             retained = backend.decode_cuda_graph_metadata["k1_repeat"]
             self.assertEqual(
-                metadata.k1_repeat.index.data_ptr(), retained.index.data_ptr()
+                metadata.k1_repeat.starts.data_ptr(), retained.starts.data_ptr()
             )
             self.assertIsNone(metadata.k2_repeat)
             self.assertNotIn("k2_repeat", backend.decode_cuda_graph_metadata)
 
     def test_capture_compression_view_covers_retained_slab(self):
-        """Regression: the captured gather reads the repeat layout's index,
-        which addresses the slab offsets the compression kernel writes at,
-        so the compression view sized from cu_seqlens_cpu must cover the slab
-        -- a dense-window seed lets the captured index_select read past the view."""
+        """Regression: the captured top-k reads each verify row at the slab
+        offset the compression kernel writes at, so the compression view sized
+        from cu_seqlens_cpu must cover the slab -- a dense-window seed lets the
+        captured kernel read past the view."""
         num_draft_tokens = 2
         backend, base = make_replay_backend(
             [1] * 4, num_draft_tokens, max_bs=4, device=DEVICE
         )
         _capture_seed(backend, base, bs=4)
-        # A smaller capture reuses the retained index after a larger one wrote
-        # it; the gather reads the whole smaller view, tail included.
+        # A smaller capture rewrites the retained layout a larger one wrote.
         _, small_base = make_verify_batch([1, 1], num_draft_tokens, device=DEVICE)
         small_base.max_seq_len_q = num_draft_tokens
         metadata, _ = _capture_seed(backend, small_base, bs=2)
         for name in ("k1", "k2"):
             level = getattr(metadata, name)
-            self.assertLess(
-                int(getattr(metadata, f"{name}_repeat").index.max()),
-                level.cu_seqlens_cpu[-1],
-            )
+            repeat = getattr(metadata, f"{name}_repeat")
+            row_ends = repeat.starts + (repeat.cu_seqlens[1:] - repeat.cu_seqlens[:-1])
+            self.assertLessEqual(int(row_ends.max()), level.cu_seqlens_cpu[-1])
 
     def test_replay_refreshes_static_buffers_to_eager_geometry(self):
         """Replay must leave the static buffers,
@@ -797,8 +780,7 @@ class TestCompressLevelMetadataKernel(CustomTestCase):
 class TestRepeatedSegmentsKernel(CustomTestCase):
     def test_bit_exact_against_host_planner(self):
         """Pin fill_repeated_segments bitwise to _plan_repeated_segments over slab
-        offsets, with an empty request, a full slab and padded rows; the index
-        tail past the packed rows reads as row 0."""
+        offsets, with an empty request, a full slab and padded rows."""
         segment_rows, repeats = 8, 3
         chunk_lens = [3, 8, 0, 5]
         real_bs = len(chunk_lens)
@@ -813,29 +795,63 @@ class TestRepeatedSegmentsKernel(CustomTestCase):
         )
         segment_starts = torch.arange(bs + 1, dtype=torch.int32, device=DEVICE)
         segment_starts *= segment_rows
-        index = torch.full(
-            (bs * repeats * segment_rows,), -1, dtype=torch.int64, device=DEVICE
-        )
+        starts = torch.full((bs * repeats,), -1, dtype=torch.int32, device=DEVICE)
         cu_seqlens_out = torch.zeros(bs * repeats + 1, dtype=torch.int32, device=DEVICE)
 
         fill_repeated_segments(
             cu_seqlens=cu_seqlens,
             segment_starts=segment_starts,
-            index_out=index,
+            starts_out=starts,
             cu_seqlens_out=cu_seqlens_out,
             repeats=repeats,
-            segment_rows=segment_rows,
         )
 
         want = _plan_repeated_segments(
-            cu_seqlens,
-            total_tokens=sum(chunk_lens),
-            repeats=repeats,
-            segment_starts=segment_starts[:-1],
+            cu_seqlens, repeats=repeats, segment_starts=segment_starts[:-1]
         )
         self.assertTrue(torch.equal(cu_seqlens_out, want.cu_seqlens))
-        self.assertTrue(torch.equal(index[: want.index.numel()], want.index))
-        self.assertTrue((index[want.index.numel() :] == 0).all())
+        self.assertTrue(torch.equal(starts, want.starts))
+
+
+class TestCopyRepeatedSegmentsKernel(CustomTestCase):
+    def test_packs_rows_like_a_segment_gather(self):
+        """copy_repeated_segments packs each row's slab segment, over [chunks,
+        heads, dim] rows, exactly as slicing the source at the planned layout
+        does; the non-fused top-k reads that packed buffer."""
+        segment_rows, repeats = 8, 3
+        chunk_lens = [3, 8, 0, 5]
+        bs = len(chunk_lens)
+        cu_seqlens = F.pad(
+            torch.cumsum(
+                torch.tensor(chunk_lens, dtype=torch.int32, device=DEVICE),
+                dim=0,
+                dtype=torch.int32,
+            ),
+            (1, 0),
+        )
+        segment_starts = torch.arange(bs, dtype=torch.int32, device=DEVICE)
+        segment_starts *= segment_rows
+        layout = _plan_repeated_segments(
+            cu_seqlens, repeats=repeats, segment_starts=segment_starts
+        )
+        src = torch.randn(bs * segment_rows, 2, 4, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(
+            sum(chunk_lens) * repeats, 2, 4, device=DEVICE, dtype=src.dtype
+        )
+
+        copy_repeated_segments(
+            src, starts=layout.starts, cu_seqlens=layout.cu_seqlens, out=out
+        )
+
+        want = torch.cat(
+            [
+                src[int(start) : int(start) + int(end - begin)]
+                for start, begin, end in zip(
+                    layout.starts, layout.cu_seqlens[:-1], layout.cu_seqlens[1:]
+                )
+            ]
+        )
+        self.assertTrue(torch.equal(out, want))
 
 
 if __name__ == "__main__":

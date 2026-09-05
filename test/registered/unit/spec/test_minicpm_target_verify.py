@@ -217,43 +217,34 @@ class TestTreeVerifyMetadata(CustomTestCase):
 
 class TestPlanRepeatedSegments(CustomTestCase):
     def test_segments_repeat_per_draft_token(self):
-        flat = torch.arange(5, dtype=torch.float32).view(5, 1, 1)
         layout = _plan_repeated_segments(
-            torch.tensor([0, 2, 5], dtype=torch.int32), total_tokens=5, repeats=3
+            torch.tensor([0, 2, 5], dtype=torch.int32), repeats=3
         )
         self.assertEqual(layout.cu_seqlens.tolist(), [0, 2, 4, 6, 9, 12, 15])
-        want = torch.cat([flat[0:2]] * 3 + [flat[2:5]] * 3)
-        self.assertTrue(torch.equal(flat.index_select(0, layout.index), want))
+        self.assertEqual(layout.starts.tolist(), [0, 0, 0, 2, 2, 2])
 
-    def test_slab_segment_starts_gather_packed_rows(self):
-        """A layout planned over slab offsets must gather, from a slab-laid buffer,
-        what the packed layout gathers from a packed one, with equal row bounds."""
+    def test_slab_segment_starts_place_rows_with_packed_bounds(self):
+        """A layout planned over slab offsets keeps the packed row bounds and
+        starts every row of a request at its slab offset, empty requests
+        included."""
         segment_rows, num_draft_tokens = 8, 3
         chunk_lens = torch.tensor([3, 8, 0, 5], dtype=torch.int32)
         packed_cu = F.pad(torch.cumsum(chunk_lens, dim=0, dtype=torch.int32), (1, 0))
-        total = int(packed_cu[-1])
-        packed = torch.arange(total, dtype=torch.float32)
-        slab = torch.full((len(chunk_lens) * segment_rows,), float("nan"))
         slab_starts = torch.arange(len(chunk_lens), dtype=torch.int32) * segment_rows
-        for batch_idx, n in enumerate(chunk_lens.tolist()):
-            start = batch_idx * segment_rows
-            slab[start : start + n] = packed[
-                packed_cu[batch_idx] : packed_cu[batch_idx + 1]
-            ]
 
-        packed_layout = _plan_repeated_segments(
-            packed_cu, total_tokens=total, repeats=num_draft_tokens
-        )
+        packed_layout = _plan_repeated_segments(packed_cu, repeats=num_draft_tokens)
         slab_layout = _plan_repeated_segments(
-            packed_cu,
-            total_tokens=total,
-            repeats=num_draft_tokens,
-            segment_starts=slab_starts,
+            packed_cu, repeats=num_draft_tokens, segment_starts=slab_starts
         )
 
         self.assertTrue(torch.equal(slab_layout.cu_seqlens, packed_layout.cu_seqlens))
-        self.assertTrue(
-            torch.equal(slab[slab_layout.index], packed[packed_layout.index])
+        self.assertEqual(
+            slab_layout.starts.tolist(),
+            slab_starts.repeat_interleave(num_draft_tokens).tolist(),
+        )
+        self.assertEqual(
+            packed_layout.starts.tolist(),
+            packed_cu[:-1].repeat_interleave(num_draft_tokens).tolist(),
         )
 
 
@@ -335,9 +326,9 @@ class TestBackendVerifyMetadata(CustomTestCase):
         )
         self.assertIsNone(kwargs["history_lens"])
 
-        self.assertEqual(metadata.k1_repeat.index.tolist(), [0, 0, 1, 2, 1, 2])
+        self.assertEqual(metadata.k1_repeat.starts.tolist(), [0, 0, 1, 1])
         self.assertEqual(metadata.k1_repeat.cu_seqlens.tolist(), [0, 1, 2, 4, 6])
-        self.assertEqual(metadata.k2_repeat.index.tolist(), [0, 0])
+        self.assertEqual(metadata.k2_repeat.starts.tolist(), [0, 0, 0, 0])
         self.assertEqual(metadata.k2_repeat.cu_seqlens.tolist(), [0, 0, 0, 1, 2])
 
         # dense_len=128: request 0 rows are dense, request 1 rows sparse.
