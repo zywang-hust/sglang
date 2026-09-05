@@ -389,7 +389,6 @@ class MiniCPMDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.config = config
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         if isinstance(config, MiniCPMHybridConfig):
@@ -454,6 +453,7 @@ class MiniCPMDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.layer_scale = config.scale_depth / math.sqrt(config.num_hidden_layers)
 
     def forward(
         self,
@@ -463,26 +463,27 @@ class MiniCPMDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-        hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
+        if residual is None:
+            # The fused norm later writes into residual in place; the embedding
+            # product it aliases here is a fresh tensor, not the embedding table.
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = (
+            self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            * self.layer_scale
         )
 
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states) * self.layer_scale
 
-        return hidden_states, None
+        return hidden_states, residual
 
 
 class MiniCPMModel(nn.Module):
@@ -536,7 +537,7 @@ class MiniCPMModel(nn.Module):
                 forward_batch,
                 residual,
             )
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
