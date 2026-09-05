@@ -121,20 +121,12 @@ def get_compress_k_v2(
     key_cache = get_token_to_kv_pool().get_key_buffer(layer.layer_id)
     key_cache = key_cache.view(-1, layer.tp_k_head_num, layer.head_dim)
 
-    for full_compressed_k, level, kernel_size, kernel_stride in (
-        (
-            full_compressed_k1,
-            metadata.k1,
-            k1_kernel_size,
-            k1_kernel_stride,
-        ),
-        (
-            full_compressed_k2,
-            metadata.k2,
-            k2_kernel_size,
-            k2_kernel_stride,
-        ),
-    ):
+    levels = [(full_compressed_k1, metadata.k1, k1_kernel_size, k1_kernel_stride)]
+    if full_compressed_k2 is not None:
+        levels.append(
+            (full_compressed_k2, metadata.k2, k2_kernel_size, k2_kernel_stride)
+        )
+    for full_compressed_k, level, kernel_size, kernel_stride in levels:
         compress_k_core_new(
             full_compressed_k,
             batch,
@@ -155,7 +147,7 @@ def allocate_and_compress_keys(
     forward_batch,
     metadata: MiniCPMSparseMetadata,
     k1_token_nums: int,
-    k2_token_nums: int,
+    k2_token_nums: Optional[int],
     k1_kernel_size: int,
     k1_kernel_stride: int,
     k2_kernel_size: int,
@@ -164,25 +156,6 @@ def allocate_and_compress_keys(
     device: torch.device = None,
     max_context_length: int = 32768,
 ):
-    """Allocate compressed key tensors and run compression.
-
-    Args:
-        layer: Model layer with head configuration
-        forward_batch: Forward batch info
-        metadata: MiniCPM sparse metadata
-        k1_token_nums: Number of k1 tokens to allocate
-        k2_token_nums: Number of k2 tokens to allocate
-        k1_kernel_size: K1 compression window
-        k1_kernel_stride: K1 compression stride
-        k2_kernel_size: K2 compression window
-        k2_kernel_stride: K2 compression stride
-        dtype: Tensor data type (default: bfloat16)
-        device: Tensor device (default: layer device)
-        max_context_length: Maximum context length for the model (default: 32768)
-
-    Returns:
-        Tuple of (full_compressed_k1, full_compressed_k2)
-    """
     if device is None:
         device = forward_batch.input_ids.device
 
@@ -192,12 +165,15 @@ def allocate_and_compress_keys(
         device=device,
         fill_value=float("-inf"),
     )
-    full_compressed_k2 = torch.full(
-        (k2_token_nums, layer.tp_k_head_num, layer.head_dim),
-        dtype=dtype,
-        device=device,
-        fill_value=float("-inf"),
-    )
+    # None omits K2 production; zero still allocates an empty output.
+    full_compressed_k2 = None
+    if k2_token_nums is not None:
+        full_compressed_k2 = torch.full(
+            (k2_token_nums, layer.tp_k_head_num, layer.head_dim),
+            dtype=dtype,
+            device=device,
+            fill_value=float("-inf"),
+        )
 
     get_compress_k_v2(
         layer,

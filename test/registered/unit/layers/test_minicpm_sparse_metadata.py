@@ -709,6 +709,35 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             [[10, 0], [21, 0]],
         )
 
+    def test_all_dense_prefill_maintains_only_consumed_compression_levels(self):
+        metadata = SimpleNamespace(
+            sparse_bs_list=[],
+            k1=SimpleNamespace(cu_seqlens_cpu=[0, 2]),
+            k2=SimpleNamespace(cu_seqlens_cpu=[0, 1]),
+        )
+        for fused in (False, True):
+            with self.subTest(fused=fused):
+                backend, batch, q, k, v, layer = _build_fast_path_batch(
+                    extend_prefix_lens=[0], extend_seq_lens=[2], metadata=metadata
+                )
+                backend.minicpm_fuse_topk = fused
+                backend.k1_kernel_size = backend.k1_kernel_stride = 1
+                backend.k2_kernel_size = backend.k2_kernel_stride = 2
+                backend.max_context_len = 8
+                with (
+                    patch.object(
+                        backend_module, "allocate_and_compress_keys"
+                    ) as allocate,
+                    patch.object(backend, "_forward_grouped_heads", return_value=q),
+                ):
+                    result = backend.forward_extend(q, k, v, layer, batch)
+                self.assertIs(result, q)
+                backend.get_topk_for_sparse.assert_not_called()
+                self.assertEqual(allocate.call_args.kwargs["k1_token_nums"], 2)
+                self.assertEqual(
+                    allocate.call_args.kwargs["k2_token_nums"], None if fused else 1
+                )
+
     def test_block_sparse_fast_path_serves_capacity_covering_prefix(self):
         """A prefix covering the sparse row capacity takes the fast path."""
         metadata = _fast_path_sparse_metadata()
@@ -1077,27 +1106,54 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         )
         pool = SimpleNamespace(get_key_buffer=lambda _layer_id: torch.empty(1, 1, 1))
 
-        with (
-            patch.object(sparse_utils, "get_token_to_kv_pool", return_value=pool),
-            patch.object(sparse_utils, "compress_k_core_new") as compress,
-        ):
-            sparse_utils.get_compress_k_v2(
-                layer,
-                forward_batch,
-                metadata,
-                torch.empty(0),
-                torch.empty(0),
-                max_context_length=256,
-                k1_kernel_size=5,
-                k1_kernel_stride=3,
-                k2_kernel_size=13,
-                k2_kernel_stride=7,
+        for k2 in (None, torch.empty(0), torch.empty(2)):
+            with (
+                patch.object(sparse_utils, "get_token_to_kv_pool", return_value=pool),
+                patch.object(sparse_utils, "compress_k_core_new") as compress,
+            ):
+                sparse_utils.get_compress_k_v2(
+                    layer,
+                    forward_batch,
+                    metadata,
+                    torch.empty(0),
+                    k2,
+                    max_context_length=256,
+                    k1_kernel_size=5,
+                    k1_kernel_stride=3,
+                    k2_kernel_size=13,
+                    k2_kernel_stride=7,
+                )
+
+            self.assertEqual(
+                [(call.args[8], call.args[9]) for call in compress.call_args_list],
+                [(5, 3)] if k2 is None else [(5, 3), (13, 7)],
             )
 
-        self.assertEqual(
-            [(call.args[8], call.args[9]) for call in compress.call_args_list],
-            [(5, 3), (13, 7)],
-        )
+    def test_compression_allocation_distinguishes_absent_and_empty_k2(self):
+        layer = SimpleNamespace(tp_k_head_num=2, head_dim=3)
+        batch = SimpleNamespace(input_ids=torch.empty(0))
+        for count in (None, 0, 2):
+            with self.subTest(k2_tokens=count):
+                with patch.object(sparse_utils, "get_compress_k_v2") as compress:
+                    k1, k2 = sparse_utils.allocate_and_compress_keys(
+                        layer=layer,
+                        forward_batch=batch,
+                        metadata=None,
+                        k1_token_nums=4,
+                        k2_token_nums=count,
+                        k1_kernel_size=5,
+                        k1_kernel_stride=3,
+                        k2_kernel_size=13,
+                        k2_kernel_stride=7,
+                        dtype=torch.float32,
+                    )
+                self.assertEqual(k1.shape, (4, 2, 3))
+                self.assertIs(compress.call_args.args[3], k1)
+                self.assertIs(compress.call_args.args[4], k2)
+                if count is None:
+                    self.assertIsNone(k2)
+                else:
+                    self.assertEqual(k2.shape, (count, 2, 3))
 
     def test_decode_compression_uses_compact_layout(self):
         backend = MiniCPMSparseBackend.__new__(MiniCPMSparseBackend)
@@ -1114,24 +1170,43 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         layer = SimpleNamespace(tp_k_head_num=1, head_dim=2)
         forward_batch = SimpleNamespace(batch_size=2)
 
-        for use_graph_buffers in (False, True):
-            with self.subTest(use_graph_buffers=use_graph_buffers):
-                backend._use_cuda_graph_buffers = use_graph_buffers
-                backend.decode_cuda_graph_metadata = {
-                    "compress_k1": torch.empty(8, 1, 2),
-                    "compress_k2": torch.empty(4, 1, 2),
-                }
-                with patch.object(backend_module, "get_compress_k_v2") as compress:
-                    k1, k2 = backend._compress_decode_keys(
-                        torch.empty(1, dtype=torch.float16),
-                        layer,
-                        forward_batch,
-                    )
+        for fused in (False, True):
+            backend.minicpm_fuse_topk = fused
+            for use_graph_buffers in (False, True):
+                with self.subTest(use_graph_buffers=use_graph_buffers):
+                    backend._use_cuda_graph_buffers = use_graph_buffers
+                    backend.decode_cuda_graph_metadata = {
+                        "compress_k1": torch.empty(8, 1, 2),
+                        "compress_k2": torch.empty(4, 1, 2),
+                    }
+                    with patch.object(backend_module, "get_compress_k_v2") as compress:
+                        k1, k2 = backend._compress_decode_keys(
+                            torch.empty(1, dtype=torch.float16),
+                            layer,
+                            forward_batch,
+                        )
 
-                self.assertEqual(k1.shape, (3, 1, 2))
-                self.assertEqual(k2.shape, (1, 1, 2))
-                compress.assert_called_once()
-                self.assertNotIn("padded", compress.call_args.kwargs)
+                    self.assertEqual(k1.shape, (3, 1, 2))
+                    if fused:
+                        self.assertIsNone(k2)
+                    else:
+                        self.assertEqual(k2.shape, (1, 1, 2))
+                    compress.assert_called_once()
+                    self.assertIs(compress.call_args.kwargs["full_compressed_k2"], k2)
+                    if use_graph_buffers:
+                        self.assertEqual(
+                            k1.data_ptr(),
+                            backend.decode_cuda_graph_metadata[
+                                "compress_k1"
+                            ].data_ptr(),
+                        )
+                        if not fused:
+                            self.assertEqual(
+                                k2.data_ptr(),
+                                backend.decode_cuda_graph_metadata[
+                                    "compress_k2"
+                                ].data_ptr(),
+                            )
 
     def test_fused_topk_prefill_kernels_compile_for_all_batches_at_startup(self):
         fake_fuse_kernel = ModuleType("sglang.srt.layers.attention.minicpm.fuse_kernel")
@@ -1306,11 +1381,11 @@ import sglang.srt.layers.attention.minicpm.backend
             topk_max_seqlen_k=1,
             k1=SimpleNamespace(
                 cu_seqlens=_DeviceOffsetsMustNotBeRead(),
-                cu_seqlens_cpu=[0, 0, 1],
+                cu_seqlens_cpu=[0, 1, 2],
             ),
             k2=SimpleNamespace(
                 cu_seqlens=_DeviceOffsetsMustNotBeRead(),
-                cu_seqlens_cpu=[0, 0, 1],
+                cu_seqlens_cpu=[0, 1, 2],
             ),
         )
         backend.k1_kernel_size = 1
@@ -1322,32 +1397,40 @@ import sglang.srt.layers.attention.minicpm.backend
         layer = SimpleNamespace(tp_q_head_num=1, tp_k_head_num=1, head_dim=1)
         forward_batch = SimpleNamespace(batch_size=2, extend_seq_lens_cpu=[1, 1])
 
-        with (
-            patch.object(
-                backend_module,
-                "allocate_and_compress_keys",
-                return_value=(torch.ones(1, 1, 1), torch.ones(1, 1, 1)),
-            ) as allocate,
-            patch.object(
-                backend,
-                "_get_fused_topk_kernel",
-                return_value="sparse-kernel",
-            ) as get_kernel,
-            patch.object(
-                backend,
-                "sparse_get_topk_impl",
-                side_effect=lambda *_args, **kwargs: kwargs["fused_kernel"],
-            ),
-        ):
-            result = backend.get_topk_for_sparse(
-                query_states=torch.empty(2, 1, 1),
-                key_states=torch.empty(2, 1, 1),
-                layer=layer,
-                forward_batch=forward_batch,
-            )
-
-        self.assertEqual(result, "sparse-kernel")
-        get_kernel.assert_called_once_with(1, is_prefill=True)
+        k1 = torch.tensor([3.0, 7.0]).reshape(2, 1, 1)
+        k2 = torch.tensor([11.0, 13.0]).reshape(2, 1, 1)
+        for fused in (False, True):
+            with self.subTest(fused=fused):
+                backend.minicpm_fuse_topk = fused
+                with (
+                    patch.object(
+                        backend_module,
+                        "allocate_and_compress_keys",
+                        return_value=(k1, None if fused else k2),
+                    ) as allocate,
+                    patch.object(
+                        backend,
+                        "_get_fused_topk_kernel",
+                        return_value="sparse-kernel" if fused else None,
+                    ) as get_kernel,
+                    patch.object(backend, "sparse_get_topk_impl") as select,
+                ):
+                    backend.get_topk_for_sparse(
+                        query_states=torch.empty(2, 1, 1),
+                        key_states=torch.empty(2, 1, 1),
+                        layer=layer,
+                        forward_batch=forward_batch,
+                    )
+                self.assertEqual(
+                    allocate.call_args.kwargs["k2_token_nums"], None if fused else 2
+                )
+                selected = select.call_args.kwargs
+                self.assertTrue(torch.equal(selected["compressed_k"], k1[1:]))
+                if fused:
+                    self.assertIsNone(selected["compressed_k2"])
+                else:
+                    self.assertTrue(torch.equal(selected["compressed_k2"], k2[1:]))
+                get_kernel.assert_called_once_with(1, is_prefill=True)
 
     def test_decode_recompresses_keys_and_compiles_decode_fused_topk(self):
         """Decode rows must re-compress staged keys, feed the plain level offsets

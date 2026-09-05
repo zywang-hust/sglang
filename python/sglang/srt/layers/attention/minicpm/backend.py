@@ -560,10 +560,13 @@ class MiniCPMSparseBackend(AttentionBackend):
         query_states: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         metadata = self.forward_metadata
         compressed = []
         for name, level in (("k1", metadata.k1), ("k2", metadata.k2)):
+            if name == "k2" and self.minicpm_fuse_topk:
+                compressed.append(None)
+                continue
             total = level.cu_seqlens_cpu[-1]
             if self._use_cuda_graph_buffers:
                 buffer = self.decode_cuda_graph_metadata[f"compress_{name}"][:total]
@@ -608,7 +611,9 @@ class MiniCPMSparseBackend(AttentionBackend):
                 forward_batch=forward_batch,
                 metadata=metadata,
                 k1_token_nums=metadata.k1.cu_seqlens_cpu[-1],
-                k2_token_nums=metadata.k2.cu_seqlens_cpu[-1],
+                k2_token_nums=(
+                    None if self.minicpm_fuse_topk else metadata.k2.cu_seqlens_cpu[-1]
+                ),
                 k1_kernel_size=self.k1_kernel_size,
                 k1_kernel_stride=self.k1_kernel_stride,
                 k2_kernel_size=self.k2_kernel_size,
@@ -635,7 +640,11 @@ class MiniCPMSparseBackend(AttentionBackend):
                     (full_compressed_k2, metadata.k2),
                 ):
                     compressed.append(
-                        _gather_compressed_keys(full_compressed_k, level, sparse_bs)
+                        (None, None)
+                        if full_compressed_k is None
+                        else _gather_compressed_keys(
+                            full_compressed_k, level, sparse_bs
+                        )
                     )
 
             (compressed_k, compressed_cu_seqlens), (
@@ -841,7 +850,9 @@ class MiniCPMSparseBackend(AttentionBackend):
                 forward_batch=forward_batch,
                 metadata=metadata,
                 k1_token_nums=metadata.k1.cu_seqlens_cpu[-1],
-                k2_token_nums=metadata.k2.cu_seqlens_cpu[-1],
+                k2_token_nums=(
+                    None if self.minicpm_fuse_topk else metadata.k2.cu_seqlens_cpu[-1]
+                ),
                 k1_kernel_size=self.k1_kernel_size,
                 k1_kernel_stride=self.k1_kernel_stride,
                 k2_kernel_size=self.k2_kernel_size,
