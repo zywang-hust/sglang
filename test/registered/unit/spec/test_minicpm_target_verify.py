@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.minicpm.sparse_utils import (
     _build_sparse_decode_metadata,
     _plan_repeated_segments,
 )
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -287,6 +288,32 @@ def _k1_k2_stub() -> tuple[SimpleNamespace, SimpleNamespace]:
 
 
 class TestBackendVerifyMetadata(CustomTestCase):
+    def test_dspark_compression_counts_verify_width_once(self):
+        """DSpark's expanded CPU lengths must not add the verify window twice."""
+        width = 8
+        live_lengths = torch.tensor([248, 200], dtype=torch.int32)
+        spec_info = DFlashVerifyInput(
+            draft_token=torch.zeros(16, dtype=torch.int64),
+            positions=torch.zeros(16, dtype=torch.int64),
+            draft_token_num=width,
+            live_seq_lens_cpu=live_lengths,
+        )
+        backend, flash_attn_backend = make_spec_backend(
+            num_draft_tokens=width, eagle_topk=1
+        )
+        forward_batch, base_metadata = _verify_forward_batch(
+            live_lengths.tolist(), width, spec_info=spec_info
+        )
+        forward_batch.seq_lens_cpu = live_lengths + width
+        flash_attn_backend.forward_metadata = base_metadata
+        with patch.object(
+            backend_module,
+            "_build_k1_k2_compression_metadata",
+            return_value=_k1_k2_stub(),
+        ) as build:
+            backend.init_forward_metadata(forward_batch)
+        self.assertEqual(build.call_args.kwargs["seq_lens_cpu"].tolist(), [256, 208])
+
     def test_tree_drafts_reject_short_window(self):
         """Tree rows drop hidden draft keys from the chain row length, which
         only holds when the local window keeps every draft key's block."""

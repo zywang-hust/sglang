@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -458,6 +459,14 @@ class MiniCPMSparseBackend(AttentionBackend):
         num_draft_tokens = self.speculative_num_draft_tokens
         num_draft_visible = None
         history_lens = None
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        spec_info = forward_batch.spec_info
+        if (
+            isinstance(spec_info, DFlashVerifyInput)
+            and spec_info.live_seq_lens_cpu is not None
+        ):
+            # DSpark saves committed lengths before expanding attention CPU lengths.
+            seq_lens_cpu = spec_info.live_seq_lens_cpu
         if self.speculative_eagle_topk > 1:
             num_draft_visible, history_lens = self._stage_tree_verify_drafts(
                 forward_batch, metadata
@@ -468,7 +477,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             req_pool_indices=forward_batch.req_pool_indices,
             base_metadata=metadata.base,
             levels=self.compress_levels,
-            seq_lens_cpu=forward_batch.seq_lens_cpu + num_draft_tokens,
+            seq_lens_cpu=seq_lens_cpu + num_draft_tokens,
             history_lens=history_lens,
         )
         _plan_sparse_verify(
