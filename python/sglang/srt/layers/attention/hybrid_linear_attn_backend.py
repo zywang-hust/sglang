@@ -1264,6 +1264,11 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
+        if mamba_caches.intermediate_kv is not None:
+            self.linear_attn_backend.commit_verify_state(
+                last_correct_step_indices, mamba_track_indices, mamba_steps_to_track
+            )
+            return
 
         # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
         # during verify); no intermediate_ssm is allocated. Replay the accepted

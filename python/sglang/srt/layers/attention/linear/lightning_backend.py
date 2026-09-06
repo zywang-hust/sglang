@@ -8,6 +8,11 @@ from sglang.kernels.ops.attention.linear.lightning_attn import (
     linear_decode_forward_triton,
 )
 from sglang.kernels.ops.attention.linear.seg_la import SegLaMeta, seg_la_fwd
+from sglang.kernels.ops.attention.linear.seg_la_verify_replay import (
+    build_verify_parents,
+    commit_verify_kv,
+    verify_with_kv_cache,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.linear_metadata import (
     BailingLinearMetadata,
@@ -77,6 +82,9 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             self.device,
             layerwise_decay=layerwise_decay,
         )
+        mamba_layers = self.req_to_token_pool.mamba_pool.mamba_layer_ids
+        self.first_mamba_layer = mamba_layers[0] if mamba_layers else None
+        self.verify_slopes = torch.stack(self.tp_slope)[mamba_layers]
         self.linear_backend = getattr(config, "linear_backend", "seg_la")
         logger.info(
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
@@ -111,6 +119,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         self.forward_metadata.mamba_track_indices = metadata.mamba_track_indices
         self.forward_metadata.retrieve_next_token = metadata.retrieve_next_token
         self.forward_metadata.retrieve_next_sibling = metadata.retrieve_next_sibling
+        self.forward_metadata.retrieve_parent_token = metadata.retrieve_parent_token
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
@@ -127,6 +136,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         self.forward_metadata.has_mamba_track_mask = metadata.has_mamba_track_mask
         self.forward_metadata.retrieve_next_token = metadata.retrieve_next_token
         self.forward_metadata.retrieve_next_sibling = metadata.retrieve_next_sibling
+        self.forward_metadata.retrieve_parent_token = metadata.retrieve_parent_token
 
     @staticmethod
     def _build_slope_tensor(
@@ -368,7 +378,31 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
-        if self.linear_backend == "minimax":
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and mamba_cache_params.intermediate_kv is not None
+        ):
+            if (
+                layer_id == self.first_mamba_layer
+                and metadata.retrieve_next_token is not None
+            ):
+                build_verify_parents(
+                    next_token=metadata.retrieve_next_token,
+                    next_sibling=metadata.retrieve_next_sibling,
+                    parents=metadata.retrieve_parent_token,
+                )
+            o = verify_with_kv_cache(
+                q=q,
+                k=k,
+                v=v,
+                state=ssm_states,
+                kv_cache=mamba_cache_params.intermediate_kv,
+                slots=cache_indices,
+                slopes=self.tp_slope[layer_id],
+                parents=metadata.retrieve_parent_token,
+                scale=layer.scaling,
+            )
+        elif self.linear_backend == "minimax":
             o = self._prefill_and_mix_infer(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k,
@@ -442,6 +476,24 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 ssm_states[dst_masked] = ssm_states[src_masked]
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def commit_verify_state(
+        self,
+        last_steps,
+        track_indices,
+        track_steps,
+    ):
+        cache = self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        commit_verify_kv(
+            state=cache.temporal,
+            kv_cache=cache.intermediate_kv,
+            slots=self.forward_metadata.mamba_cache_indices[: last_steps.numel()],
+            last_steps=last_steps,
+            slopes=self.verify_slopes,
+            parents=self.forward_metadata.retrieve_parent_token,
+            track_slots=track_indices,
+            track_steps=track_steps,
+        )
 
     def forward_decode(
         self,

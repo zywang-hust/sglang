@@ -274,9 +274,11 @@ def test_non_lightning_minicpm_is_not_classified_as_linear_attention():
         assert get_linear_attn_spec_by_arch(architecture) is None
 
 
-def test_lightning_backend_reads_structural_linear_config(monkeypatch):
+@pytest.mark.parametrize("mamba_layers", ([0, 1], []))
+def test_lightning_backend_reads_structural_linear_config(monkeypatch, mamba_layers):
     def fake_base_init(self, model_runner):
         self.topk = 1
+        self.req_to_token_pool = model_runner.req_to_token_pool
 
     monkeypatch.setattr(MambaAttnBackendBase, "__init__", fake_base_init)
     config = SimpleNamespace(
@@ -288,7 +290,8 @@ def test_lightning_backend_reads_structural_linear_config(monkeypatch):
     model_runner = SimpleNamespace(
         req_to_token_pool=SimpleNamespace(
             mamba_pool=SimpleNamespace(
-                mamba_cache=SimpleNamespace(conv=[torch.empty(0)])
+                mamba_cache=SimpleNamespace(conv=[torch.empty(0)]),
+                mamba_layer_ids=mamba_layers,
             )
         ),
         sliding_window_size=None,

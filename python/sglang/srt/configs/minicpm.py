@@ -166,7 +166,9 @@ class MiniCPMHybridConfig(PretrainedConfig):
             conv_kernel=1,
         )
 
-        return Mamba2CacheParams(shape=shape, layers=lightning_layer_ids)
+        return Mamba2CacheParams(
+            shape=shape, layers=lightning_layer_ids, use_kv_verify_cache=True
+        )
 
     @property
     def full_attention_layer_ids(self):

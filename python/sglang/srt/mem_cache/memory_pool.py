@@ -427,6 +427,8 @@ class MambaPool:
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
+        # [layer, verify row, step, K/V, head, dim]; FP32 preserves input values.
+        intermediate_kv: Optional[torch.Tensor] = None
 
     def _detect_conv_window_axis(
         self, conv_state_shape: List[Tuple[int, int]], win_len: int
@@ -735,7 +737,7 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                if enable_linear_replayssm_spec or cache_params.use_kv_verify_cache:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -749,6 +751,22 @@ class MambaPool:
                         ),
                         dtype=ssm_dtype,
                         device="cuda",
+                    )
+                intermediate_kv = None
+                if cache_params.use_kv_verify_cache:
+                    heads, key_dim, value_dim = temporal_state_shape
+                    assert key_dim == value_dim
+                    intermediate_kv = torch.empty(
+                        (
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            2,
+                            heads,
+                            key_dim,
+                        ),
+                        dtype=torch.float32,
+                        device=device,
                     )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -825,6 +843,7 @@ class MambaPool:
                     conv=conv_state,
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
+                    intermediate_kv=intermediate_kv,
                     intermediate_conv_window=intermediate_conv_window_cache,
                     replayssm_d=replayssm_d,
                     replayssm_k=replayssm_k,
@@ -838,12 +857,18 @@ class MambaPool:
                     if intermediate_ssm_state_cache is not None
                     else 0.0
                 )
+                intermediate_kv_gb = (
+                    get_tensor_size_bytes(intermediate_kv) / GB
+                    if intermediate_kv is not None
+                    else 0.0
+                )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {intermediate_ssm_gb:.2f}GB "
+                    f"intermediate_kv size: {intermediate_kv_gb:.2f}GB "
                     # Report the deduplicated PHYSICAL conv-window buffers (the view
                     # over-reports its logical, un-deduplicated size).
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
@@ -1092,6 +1117,7 @@ class MambaPool:
     _NON_TRANSFER_STATE_FIELDS = frozenset(
         {
             "intermediate_ssm",
+            "intermediate_kv",
             "intermediate_conv_window",
             "replayssm_d",
             "replayssm_k",

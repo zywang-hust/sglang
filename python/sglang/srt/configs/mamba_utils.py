@@ -111,6 +111,7 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
 class BaseLinearStateParams(ABC):
     dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
     layers: list[int]
+    use_kv_verify_cache: bool = False
 
     @property
     def mamba_cache_per_req(self) -> int:
@@ -123,6 +124,13 @@ class BaseLinearStateParams(ABC):
             conv_numel * self.dtype.conv.itemsize
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
+
+    @property
+    def verify_cache_per_token(self) -> int:
+        if self.use_kv_verify_cache:
+            heads, key_dim, value_dim = self.shape.temporal
+            return heads * (key_dim + value_dim) * 4 * len(self.layers)
+        return self.mamba_cache_per_req
 
     def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
         """Per-slot bytes of the ReplaySSM spec-verify fold window (all

@@ -2251,6 +2251,9 @@ class KVCacheConfigurator:
             config.mamba2_cache_params.mamba_cache_per_req * pp_layer_scale
         )
 
+        stage_verify_per_token = int(
+            config.mamba2_cache_params.verify_cache_per_token * pp_layer_scale
+        )
         has_spec_dec = not self.spec_algorithm.is_none()
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
@@ -2301,7 +2304,7 @@ class KVCacheConfigurator:
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    stage_per_req
+                    stage_verify_per_token
                     * (capped_reqs + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
@@ -2320,7 +2323,7 @@ class KVCacheConfigurator:
             # pool's padding slot). Skipped under replayssm.
             if has_spec_dec and not replayssm_active:
                 intermediate_size = (
-                    stage_per_req
+                    stage_verify_per_token
                     * (get_schedule().max_mamba_cache_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
@@ -2332,7 +2335,7 @@ class KVCacheConfigurator:
 
             # Solve jointly for max_mamba_cache_size (K), including the pool's
             # +1 padding slot on both buffers (see memory_pool.py):
-            #   (K + 1) * per_req + (K / ratio + 1) * D * per_req = mamba_budget_bytes
+            #   (K + 1) * state_bytes + (K / ratio + 1) * D * verify_bytes = budget
             mamba_budget = (
                 total_rest_memory
                 * get_schedule().mamba_full_memory_ratio
@@ -2347,8 +2350,8 @@ class KVCacheConfigurator:
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_req * (1 + D))
-                        // (per_req * (1 + D / ratio))
+                        (mamba_budget_bytes - per_req - D * stage_verify_per_token)
+                        // (per_req + D * stage_verify_per_token / ratio)
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
@@ -2357,7 +2360,7 @@ class KVCacheConfigurator:
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = stage_verify_per_token * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + replayssm_ring_per_req
