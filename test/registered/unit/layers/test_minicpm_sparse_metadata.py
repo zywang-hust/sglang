@@ -27,7 +27,7 @@ from sglang.srt.layers.attention.minicpm.sparse_utils import (
     CompressionLevelMetadata,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 
 
 def _compression_layout():
